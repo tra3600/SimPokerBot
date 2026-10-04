@@ -143,3 +143,65 @@ def test_human_tournament_quit_returns_none():
     from SimuPokerBot import run_human_tournament
     assert run_human_tournament(make_bots(["station"]), seed=1, input_fn=scripted("q"),
                                 output_fn=lambda *_: None) is None
+
+
+def _play_network(client_inputs, **server_kwargs):
+    import threading
+    from SimuPokerBot import run_client, run_server
+    port_ready, result, outputs = threading.Event(), {}, {}
+    port = []
+
+    def on_listen(p):
+        port.append(p)
+        port_ready.set()
+
+    def serve():
+        result["r"] = run_server(port=0, players=len(client_inputs), on_listen=on_listen,
+                                 output_fn=lambda *_: None, timeout=10, **server_kwargs)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    assert port_ready.wait(5)
+    threads = []
+    for name, fn in client_inputs.items():
+        outputs[name] = []
+        c = threading.Thread(target=run_client, daemon=True,
+                             args=("127.0.0.1", port[0], name, fn, outputs[name].append))
+        c.start()
+        threads.append(c)
+    t.join(60)
+    for c in threads:
+        c.join(5)
+    assert not t.is_alive()
+    return result["r"], outputs
+
+
+def test_network_cash_two_humans():
+    always_call = lambda prompt="": "c"
+    totals, out = _play_network({"alice": always_call, "bob": always_call}, hands=3, seed=1)
+    assert sum(totals.values()) == 0 and set(totals) == {"alice", "bob"}
+    assert any("Vos cartes" in l for l in out["alice"])
+    assert any("Fin de la partie" in l for l in out["bob"])
+
+
+def test_network_player_quits_ends_game():
+    totals, out = _play_network({"alice": lambda p="": "q", "bob": lambda p="": "c"}, hands=5, seed=2)
+    assert any("Fin de la partie" in l for l in out["bob"])
+
+
+def test_network_tournament_with_bot():
+    from SimuPokerBot import make_bots
+    shove = lambda prompt="": "a" if "a = tapis" in prompt else "c"
+    ranking, out = _play_network({"alice": shove, "bob": shove}, tournament=True, seed=3,
+                                 opponents=make_bots(["station"]))
+    assert sorted(ranking) == ["alice", "bob", "station"]
+    assert any("Classement final" in l for l in out["alice"])
+
+
+def test_conn_rejects_garbage():
+    import socket as sk
+    from SimuPokerBot import Conn
+    a, b = sk.socketpair()
+    b.sendall(b"pas du json\n")
+    with pytest.raises(ConnectionError):
+        Conn(a).recv(1)

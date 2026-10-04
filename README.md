@@ -41,3 +41,19 @@ Commandes : `f` se coucher · `c` suivre / check · `r [montant]` relancer *à* 
     python SimuPokerBot.py --mode human --tournament --bots tight,loose,maniac --seed 1
 
 Même format que le mode tournoi (1000 jetons, blinds 10/20 croissantes toutes les `--level-hands` mains), mais les tapis restent d'une main à l'autre : la ligne « Tapis » rappelle les stacks avant chaque main. Le tournoi s'arrête quand vous êtes éliminé (votre place finale s'affiche), quand vous gagnez, ou quand vous tapez `q`.
+
+## Mode multijoueur en réseau
+Jeu à plusieurs humains (jetons fictifs) via TCP, un joueur héberge, les autres se connectent.
+
+    # Hôte (attend 3 joueurs, avec 2 bots en complément ; tournoi)
+    python SimuPokerBot.py --mode server --host 0.0.0.0 --port 5555 --players 3 --bots tight,maniac --tournament
+
+    # Chaque joueur (sur sa machine)
+    python SimuPokerBot.py --mode client --host <ip_de_l_hote> --port 5555 --name Alice
+
+- Sans `--tournament` : mode cash (tapis remis à `--stack` à chaque main, totaux affichés), jusqu'à `--hands` mains ou jusqu'à ce qu'il ne reste plus assez de joueurs.
+- Avec `--tournament` : élimination, blinds croissantes ; le classement final est diffusé à tous (les éliminés continuent à suivre la partie).
+- Les clients voient leurs propres cartes ; celles des autres ne sont révélées qu'au showdown. Mêmes commandes qu'en mode humain (`f`, `c`, `r [montant]`, `a`, `q`).
+- `--timeout` (120 s par défaut) : sans réponse, le joueur se couche / check. Un joueur déconnecté se couche automatiquement.
+- Total humains + bots : 2 à 9. `--host` vaut `127.0.0.1` par défaut (local uniquement) ; `0.0.0.0` ouvre la partie au réseau local.
+- Sécurité : le protocole est en clair et sans authentification (pseudo libre) — à réserver à un réseau de confiance, ne pas exposer sur Internet.

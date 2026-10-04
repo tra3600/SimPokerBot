@@ -14,7 +14,9 @@ Exemples :
     python SimuPokerBot.py --mode human --tournament --bots tight,loose,maniac
 """
 import argparse
+import json
 import random
+import socket
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -470,13 +472,13 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
 
 def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
                    blind_growth=1.5, max_hands=1000, seed=None, verbose=False,
-                   log=None, show_hole=True, stop_when_out=None):
+                   log=None, show_hole=True, stop_when_out=None, should_stop=None):
     """Joue un tournoi jusqu'à ce qu'il reste un joueur.
 
     Les blinds augmentent de ``blind_growth`` toutes les ``level_hands`` mains.
     Renvoie la liste des noms classés du vainqueur au premier éliminé.
     ``stop_when_out`` : un bot dont l'élimination arrête le tournoi (le reste est classé
-    selon les tapis). ``log`` reçoit le texte affiché, ``show_hole=False`` cache les cartes.
+    selon les tapis). ``should_stop()`` est testé avant chaque main. ``log`` reçoit le texte affiché, ``show_hole=False`` cache les cartes.
     """
     rng = random.Random(seed)
     if seed is not None:
@@ -486,7 +488,7 @@ def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
     button, bb, hand_no = 0, big_blind, 0
     log = log or (print if verbose else None)
     say = log or (lambda *_: None)
-    while len(stacks) > 1 and hand_no < max_hands:
+    while len(stacks) > 1 and hand_no < max_hands and not (should_stop and should_stop()):
         alive = list(stacks)
         if hand_no and hand_no % level_hands == 0:
             bb = max(bb + 2, int(bb * blind_growth)) // 2 * 2
@@ -564,28 +566,232 @@ def print_report(results, hands):
         print(f"{name:<10}{r['net']:>15.0f}{r['bb']:>12.1f}{r['bb_per_100']:>10.1f}{r['win_rate']:>15.1%}")
 
 
+# --------------------------------------------------------------------------
+# Multijoueur en réseau (TCP, jetons fictifs, protocole JSON ligne par ligne)
+# --------------------------------------------------------------------------
+DEFAULT_PORT = 5555
+MAX_LINE = 4096  # taille maximale d'un message reçu d'un client
+
+
+class Conn:
+    """Connexion JSON ligne par ligne avec tampon (supporte les timeouts sans corruption)."""
+
+    def __init__(self, sock):
+        self.sock, self.buf = sock, b""
+
+    def send(self, **msg):
+        self.sock.sendall(json.dumps(msg, ensure_ascii=False).encode() + b"\n")
+
+    def recv(self, timeout=None):
+        """Renvoie le prochain message (dict). Lève TimeoutError ou ConnectionError."""
+        self.sock.settimeout(timeout)
+        while b"\n" not in self.buf:
+            if len(self.buf) > MAX_LINE:
+                raise ConnectionError("message trop long")
+            data = self.sock.recv(4096)
+            if not data:
+                raise ConnectionError("connexion fermée")
+            self.buf += data
+        line, self.buf = self.buf.split(b"\n", 1)
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            raise ConnectionError("message invalide")
+        if not isinstance(msg, dict):
+            raise ConnectionError("message invalide")
+        return msg
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class RemoteBot(HumanBot):
+    """Joueur distant : mêmes décisions que HumanBot, mais saisies/affichages passent par le réseau."""
+
+    def __init__(self, name, conn, timeout=120):
+        super().__init__(name, input_fn=self._ask, output_fn=self.tell)
+        self.conn, self.timeout, self.gone = conn, timeout, False
+
+    def tell(self, text):
+        if self.gone:
+            return
+        try:
+            self.conn.send(t="msg", text=str(text))
+        except OSError:
+            self.disconnect()
+
+    def _ask(self, prompt):
+        self.conn.send(t="ask", text=prompt)
+        reply = self.conn.recv(self.timeout).get("r", "")
+        return reply if isinstance(reply, str) else ""
+
+    def disconnect(self):
+        self.gone = True
+        self.conn.close()
+
+    def act(self, view):
+        if self.gone:
+            return FOLD, 0
+        try:
+            return super().act(view)
+        except TimeoutError:
+            self.tell(f"Temps écoulé ({self.timeout}s) : vous êtes couché / check.")
+            return FOLD, 0
+        except (QuitGame, OSError):  # QuitGame : le client a tapé q ; OSError : coupure
+            self.disconnect()
+            return FOLD, 0
+
+
+def _unique_name(name, taken):
+    name = "".join(ch for ch in str(name) if ch.isprintable()).strip()[:15] or "Joueur"
+    base, k = name, 2
+    while name in taken:
+        name, k = f"{base}{k}", k + 1
+    return name
+
+
+def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), hands=None,
+               tournament=False, stack=None, big_blind=None, level_hands=10, seed=None,
+               timeout=120, on_listen=None, output_fn=print):
+    """Héberge une partie : attend ``players`` joueurs humains, les fait jouer entre eux
+    (et contre ``opponents``) puis renvoie les résultats (gains cash ou classement tournoi)."""
+    stack = stack or (1000 if tournament else 100)
+    big_blind = big_blind or (20 if tournament else 2)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(players)
+    output_fn(f"Serveur en écoute sur {host}:{server.getsockname()[1]} "
+              f"({players} joueur(s) attendu(s))")
+    if on_listen:
+        on_listen(server.getsockname()[1])
+    remotes, taken = [], {b.name for b in opponents}
+    try:
+        while len(remotes) < players:
+            sock, addr = server.accept()
+            conn = Conn(sock)
+            try:
+                hello = conn.recv(30)
+            except (OSError, ConnectionError):
+                conn.close()
+                continue
+            name = _unique_name(hello.get("name", ""), taken)
+            taken.add(name)
+            bot = RemoteBot(name, conn, timeout)
+            remotes.append(bot)
+            output_fn(f"{name} connecté depuis {addr[0]} ({len(remotes)}/{players})")
+            bot.tell(f"Bienvenue {name} ! En attente des autres joueurs ({len(remotes)}/{players})...")
+            for other in remotes[:-1]:
+                other.tell(f"{name} a rejoint la table ({len(remotes)}/{players}).")
+    finally:
+        server.close()
+
+    def broadcast(text):
+        output_fn(text)
+        for r in remotes:
+            r.tell(text)
+
+    everyone = remotes + list(opponents)
+    broadcast("La partie commence : " + ", ".join(b.name for b in everyone))
+    rng = random.Random(seed)
+    if seed is not None:
+        random.seed(seed)
+    try:
+        if tournament:
+            ranking = run_tournament(everyone, stack, big_blind, level_hands, seed=seed, log=broadcast,
+                                     show_hole=False,
+                                     should_stop=lambda: all(r.gone for r in remotes))
+            broadcast("\nClassement final : " + " > ".join(f"{i}. {n}" for i, n in enumerate(ranking, 1)))
+            return ranking
+        totals, played = defaultdict(int), 0
+        while hands is None or played < hands:
+            active = [b for b in everyone if not getattr(b, "gone", False)]
+            if len(active) < 2 or all(r.gone for r in remotes):
+                break
+            broadcast(f"\n=== Main {played + 1} (blinds {big_blind // 2}/{big_blind}) ===")
+            hand = Hand(active, button=played % len(active), stack=stack, big_blind=big_blind,
+                        rng=rng, log=broadcast, show_hole=False)
+            for b, p in zip(active, hand.play()):
+                totals[b.name] += p
+            played += 1
+            broadcast("--- Totaux : " + ", ".join(f"{b.name} {totals[b.name]:+d}" for b in everyone))
+        broadcast(f"\nFin de la partie après {played} main(s).")
+        return dict(totals)
+    finally:
+        for r in remotes:
+            if not r.gone:
+                r.tell("Le serveur ferme la partie. Merci d'avoir joué !")
+                r.disconnect()
+
+
+def run_client(host, port, name="Joueur", input_fn=input, output_fn=print):
+    """Se connecte à un serveur et relaie affichages / saisies jusqu'à la fin de la partie."""
+    conn = Conn(socket.create_connection((host, port), timeout=15))
+    conn.send(name=name)
+    try:
+        while True:
+            msg = conn.recv(None)
+            if msg.get("t") == "msg":
+                output_fn(msg.get("text", ""))
+            elif msg.get("t") == "ask":
+                try:
+                    answer = input_fn(msg.get("text", ""))
+                except (EOFError, KeyboardInterrupt):
+                    answer = "q"
+                conn.send(r=answer)
+    except (ConnectionError, OSError):
+        output_fn("Connexion terminée.")
+    finally:
+        conn.close()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Simulation de Texas Hold'em No-Limit entre bots")
-    p.add_argument("--bots", default="tight,equity,loose,station",
-                   help=f"stratégies séparées par des virgules ({', '.join(STRATEGIES)})")
+    p.add_argument("--bots", default=None,
+                   help=f"stratégies séparées par des virgules ({', '.join(STRATEGIES)}) ; "
+                        "défaut : tight,equity,loose,station (aucun en mode server)")
     p.add_argument("--hands", type=int, default=1000)
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament", "human"), default="cash",
+    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client"), default="cash",
                    help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
-                        "human : vous jouez contre les bots")
+                        "human : vous jouez contre les bots ; server / client : partie en réseau")
+    p.add_argument("--host", default=None,
+                   help="client : adresse du serveur (défaut 127.0.0.1) ; server : adresse d'écoute "
+                        "(défaut 127.0.0.1, utilisez 0.0.0.0 pour le réseau local)")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--name", default="Joueur", help="votre pseudo (mode client)")
+    p.add_argument("--players", type=int, default=2, help="joueurs humains attendus (mode server)")
+    p.add_argument("--timeout", type=int, default=120, help="secondes par décision (mode server)")
     p.add_argument("--tournaments", type=int, default=1, help="nombre de tournois (mode tournament)")
     p.add_argument("--level-hands", type=int, default=10, help="mains par niveau de blinds (tournoi)")
     p.add_argument("--tournament", action="store_true",
-                   help="avec --mode human : jouer un tournoi (élimination, blinds croissantes)")
+                   help="avec --mode human ou server : jouer un tournoi (élimination, blinds croissantes)")
     p.add_argument("--verbose", action="store_true", help="affiche chaque main")
     args = p.parse_args(argv)
 
-    names = [n.strip() for n in args.bots.split(",") if n.strip()]
-    low = 1 if args.mode == "human" else 2
-    if not low <= len(names) <= 9 - (args.mode == "human"):
-        p.error(f"il faut entre {low} et {9 - (args.mode == 'human')} bots")
+    hands_given = "--hands" in (argv if argv is not None else sys.argv)
+    if args.mode == "client":
+        run_client(args.host or "127.0.0.1", args.port, args.name)
+        return
+    raw = args.bots if args.bots is not None else ("" if args.mode == "server" else "tight,equity,loose,station")
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if args.mode == "server":
+        if not 2 <= args.players + len(names) <= 9:
+            p.error("il faut entre 2 et 9 joueurs au total (humains + bots)")
+        run_server(args.host or "127.0.0.1", args.port, args.players, make_bots(names),
+                   args.hands if hands_given else None, args.tournament,
+                   args.stack if args.stack != 100 else None,
+                   args.big_blind if args.big_blind != 2 else None,
+                   args.level_hands, args.seed, args.timeout)
+        return
+    human = args.mode == "human"
+    if not (1 if human else 2) <= len(names) <= (8 if human else 9):
+        p.error(f"il faut entre {1 if human else 2} et {8 if human else 9} bots")
     bots = make_bots(names)
     if args.mode == "human" and args.tournament:
         run_human_tournament(bots, args.stack if args.stack != 100 else 1000,
@@ -593,7 +799,7 @@ def main(argv=None):
                              args.level_hands, args.seed)
         return
     if args.mode == "human":
-        run_human(bots, args.hands if "--hands" in (argv or sys.argv) else None,
+        run_human(bots, args.hands if hands_given else None,
                   args.stack, args.big_blind, args.seed)
         return
     if args.mode == "tournament":
