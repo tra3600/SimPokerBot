@@ -4,3 +4,5 @@ __pycache__/
 classement.json
 classement.json.bak
 *.tmp
+mains.jsonl
+*.jsonl

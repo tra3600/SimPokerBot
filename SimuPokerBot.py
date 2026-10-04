@@ -268,8 +268,9 @@ class Hand:
     """Une main de Hold'em entre ``len(bots)`` joueurs. ``self.profit`` = gain net par joueur."""
 
     def __init__(self, bots, button=0, stack=100, big_blind=2, rng=random, log=None,
-                 show_hole=True):
+                 show_hole=True, history=None, label=""):
         self.show_hole = show_hole
+        self.history, self.label, self.events = history, label, []
         self.bots, self.n = bots, len(bots)
         self.button, self.bb, self.rng = button, big_blind, rng
         self.log = log or (lambda *_: None)
@@ -300,6 +301,16 @@ class Hand:
     def _seat(self, offset):
         return (self.button + offset) % self.n
 
+    def _ev(self, kind, **data):
+        self.events.append({"e": kind, **data})
+
+    def _name(self, i):
+        return self.bots[i].name
+
+    @staticmethod
+    def _strs(cards):
+        return [Card.int_to_str(c) for c in cards]
+
     # -- déroulement -------------------------------------------------------
     def play(self):
         deck = Deck()
@@ -316,11 +327,14 @@ class Hand:
             first_pre = self._seat(3)
         self._put(sb, self.bb // 2)
         self._put(bb, self.bb)
+        self._ev("blind", p=self._name(sb), amt=self.total[sb], role="SB")
+        self._ev("blind", p=self._name(bb), amt=self.total[bb], role="BB")
 
         for street_idx, street in enumerate(STREETS):
             if street_idx > 0:
                 n_cards = 3 if street == "flop" else 1
                 self.board += deck.draw(n_cards)
+                self._ev("street", street=street, board=self._strs(self.board))
                 self.log(f"[{street}] {Card.ints_to_pretty_str(self.board)}")
                 self.bet = [0] * self.n
             if len(self._live()) == 1:
@@ -379,10 +393,13 @@ class Hand:
                 action = CALL
             if action == FOLD:
                 self.folded[i] = True
+                self._ev("fold", p=self._name(i))
                 self.log(f"  {self.bots[i].name} se couche")
                 continue
             if action == CALL:
                 self._put(i, to_call)
+                self._ev("call" if to_call else "check", p=self._name(i), amt=to_call,
+                         allin=self.stack[i] == 0)
                 self.log(f"  {self.bots[i].name} {'suit ' + str(to_call) if to_call else 'check'}")
                 continue
             # RAISE
@@ -390,7 +407,9 @@ class Hand:
             increase = target - current
             if increase >= last_raise:
                 last_raise = increase
-            self._put(i, target - self.bet[i])
+            added = target - self.bet[i]
+            self._put(i, added)
+            self._ev("raise", p=self._name(i), to=target, amt=added, allin=self.stack[i] == 0)
             raises += 1
             self.log(f"  {self.bots[i].name} relance à {self.bet[i]}")
             # tous les autres joueurs doivent répondre, en repartant après le relanceur
@@ -412,20 +431,32 @@ class Hand:
                 for k, w in enumerate(winners):
                     payout[w] += share + (1 if k < rest else 0)
             for i in live:
+                self._ev("show", p=self._name(i), cards=self._strs(self.hands[i]),
+                         hand=EVALUATOR.class_to_string(EVALUATOR.get_rank_class(scores[i])))
                 if not self.show_hole:  # cartes révélées seulement au showdown
                     self.log(f"  {self.bots[i].name}: {Card.ints_to_pretty_str(self.hands[i])}")
                 self.log(f"  {self.bots[i].name}: {EVALUATOR.class_to_string(EVALUATOR.get_rank_class(scores[i]))}")
         self.profit = [payout[i] - self.total[i] for i in range(self.n)]
         for i, p in enumerate(self.profit):
+            if payout[i] > 0:
+                self._ev("win", p=self._name(i), amt=payout[i])
             if p > 0:
                 self.log(f"  => {self.bots[i].name} gagne {p}")
+        if self.history is not None:
+            self.history.append({
+                "version": 1, "time": time.time(), "label": self.label,
+                "button": self._name(self.button), "bb": self.bb, "board": self._strs(self.board),
+                "players": [{"name": self._name(i), "stack": self.start[i],
+                             "hole": self._strs(self.hands[i])} for i in range(self.n)],
+                "events": self.events,
+                "profit": {self._name(i): self.profit[i] for i in range(self.n)}})
         return self.profit
 
 
 # --------------------------------------------------------------------------
 # Session
 # --------------------------------------------------------------------------
-def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=False):
+def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=False, history=None):
     rng = random.Random(seed)
     if seed is not None:
         random.seed(seed)  # treys.Deck utilise le module random global
@@ -435,7 +466,8 @@ def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=Fal
     for h in range(hands):
         if verbose:
             print(f"\n=== Main {h + 1} ===")
-        hand = Hand(bots, button=h % len(bots), stack=stack, big_blind=big_blind, rng=rng, log=log)
+        hand = Hand(bots, button=h % len(bots), stack=stack, big_blind=big_blind, rng=rng, log=log,
+                    history=history, label="cash")
         profit = hand.play()
         for i, p in enumerate(profit):
             net[bots[i].name] += p
@@ -443,6 +475,132 @@ def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=Fal
     return {b.name: {"net": net[b.name], "bb": net[b.name] / big_blind,
                      "bb_per_100": net[b.name] / big_blind / hands * 100,
                      "win_rate": wins[b.name] / hands} for b in bots}
+
+
+# --------------------------------------------------------------------------
+# Historique et replay des mains
+# --------------------------------------------------------------------------
+DEFAULT_HISTORY = "mains.jsonl"
+
+
+class HandHistory:
+    """Ajoute chaque main jouée (une ligne JSON) à un fichier, pour pouvoir la rejouer."""
+
+    def __init__(self, path=DEFAULT_HISTORY):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def append(self, record):
+        line = json.dumps(record, ensure_ascii=False)
+        with self._lock, open(self.path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def load_history(path):
+    """Renvoie les mains du fichier (les lignes illisibles sont ignorées)."""
+    hands = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and "players" in rec and "events" in rec:
+                hands.append(rec)
+    return hands
+
+
+def _cards(strs):
+    return Card.ints_to_pretty_str([Card.new(c) for c in strs]).strip()
+
+
+def hand_summary(rec):
+    """Résumé d'une ligne : joueurs, board final, gagnants."""
+    winners = [n for n, p in rec["profit"].items() if p > 0]
+    pot = sum(e["amt"] for e in rec["events"] if e["e"] in ("blind", "call", "raise"))
+    board = _cards(rec["board"]) if rec["board"] else "(pas de board)"
+    return (f"{', '.join(p['name'] for p in rec['players'])} | board {board} | pot {pot} | "
+            f"gagne : {', '.join(winners) or 'égalité'}")
+
+
+def format_replay(rec, number=None):
+    """Découpe une main en étapes lisibles (liste de textes), cartes de tous les joueurs révélées."""
+    steps = []
+    title = f"Main {number}" if number else "Main"
+    if rec.get("label"):
+        title += f" ({rec['label']})"
+    steps.append(f"=== {title} | blinds {rec['bb'] // 2}/{rec['bb']} | bouton : {rec['button']} ===\n"
+                 + "\n".join(f"  {p['name']:<10} tapis {p['stack']:>5}   {_cards(p['hole'])}"
+                             for p in rec["players"]))
+    pot = 0
+    for e in rec["events"]:
+        kind = e["e"]
+        if kind in ("blind", "call", "raise"):
+            pot += e["amt"]
+        tag = " (tapis)" if e.get("allin") else ""
+        if kind == "blind":
+            steps.append(f"{e['p']} poste la {e['role']} ({e['amt']})")
+        elif kind == "street":
+            steps.append(f"--- {e['street'].capitalize()} : {_cards(e['board'])} | pot {pot}")
+        elif kind == "fold":
+            steps.append(f"{e['p']} se couche")
+        elif kind == "check":
+            steps.append(f"{e['p']} check")
+        elif kind == "call":
+            steps.append(f"{e['p']} suit {e['amt']}{tag} | pot {pot}")
+        elif kind == "raise":
+            steps.append(f"{e['p']} relance à {e['to']}{tag} | pot {pot}")
+        elif kind == "show":
+            steps.append(f"{e['p']} montre {_cards(e['cards'])} : {e['hand']}")
+        elif kind == "win":
+            steps.append(f"=> {e['p']} remporte {e['amt']}")
+    steps.append("Résultat : " + ", ".join(f"{n} {p:+d}" for n, p in rec["profit"].items()))
+    return steps
+
+
+def replay_hand(rec, number=None, output_fn=print, input_fn=None, delay=0.0):
+    """Affiche une main étape par étape. Avec ``input_fn`` (mode pas à pas) : Entrée = suite,
+    ``q`` = arrêter. Renvoie False si l'utilisateur a quitté."""
+    for step in format_replay(rec, number):
+        output_fn(step)
+        if input_fn:
+            try:
+                if input_fn("   [Entrée = suite, q = quitter] ").strip().lower() == "q":
+                    return False
+            except EOFError:
+                return False
+        elif delay:
+            time.sleep(delay)
+    return True
+
+
+def run_replay(path, number=None, list_only=False, player=None, step=False, delay=0.0,
+               output_fn=print, input_fn=input):
+    """Mode replay : liste les mains enregistrées ou rejoue la main ``number`` (la dernière par défaut)."""
+    try:
+        hands = load_history(path)
+    except OSError as err:
+        output_fn(f"Impossible de lire l'historique {path} : {err.strerror or err}")
+        return False
+    if not hands:
+        output_fn("Aucune main enregistrée.")
+        return False
+    if list_only:
+        shown = 0
+        for i, rec in enumerate(hands, 1):
+            if player and player not in (p["name"] for p in rec["players"]):
+                continue
+            output_fn(f"{i:>5}. {hand_summary(rec)}")
+            shown += 1
+        if not shown:
+            output_fn(f"Aucune main pour {player!r}.")
+        return bool(shown)
+    number = len(hands) if number is None else number
+    if not 1 <= number <= len(hands):
+        output_fn(f"Main {number} introuvable : l'historique en contient {len(hands)}.")
+        return False
+    replay_hand(hands[number - 1], number, output_fn, input_fn if step else None, delay)
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -548,7 +706,7 @@ class Leaderboard:
 
 
 def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
-              input_fn=input, output_fn=print, name="Vous", leaderboard=None):
+              input_fn=input, output_fn=print, name="Vous", leaderboard=None, history=None):
     """Partie interactive : l'humain (siège 0) contre des bots, tapis remis à ``stack`` à chaque main.
 
     S'arrête après ``hands`` mains (illimité si None) ou quand le joueur tape ``q``.
@@ -563,7 +721,7 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
     while hands is None or played < hands:
         output_fn(f"\n=== Main {played + 1} (blinds {big_blind // 2}/{big_blind}) ===")
         hand = Hand(bots, button=played % len(bots), stack=stack, big_blind=big_blind,
-                    rng=rng, log=output_fn, show_hole=False)
+                    rng=rng, log=output_fn, show_hole=False, history=history, label="humain")
         try:
             profit = hand.play()
         except QuitGame:
@@ -580,7 +738,8 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
 
 def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
                    blind_growth=1.5, max_hands=1000, seed=None, verbose=False,
-                   log=None, show_hole=True, stop_when_out=None, should_stop=None):
+                   log=None, show_hole=True, stop_when_out=None, should_stop=None, history=None,
+                   label="tournoi"):
     """Joue un tournoi jusqu'à ce qu'il reste un joueur.
 
     Les blinds augmentent de ``blind_growth`` toutes les ``level_hands`` mains.
@@ -605,7 +764,8 @@ def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
             say("Tapis : " + ", ".join(f"{bots[i].name} {stacks[i]}" for i in alive))
         button %= len(alive)
         hand = Hand([bots[i] for i in alive], button=button,
-                    stack=[stacks[i] for i in alive], big_blind=bb, rng=rng, log=log, show_hole=show_hole)
+                    stack=[stacks[i] for i in alive], big_blind=bb, rng=rng, log=log, show_hole=show_hole,
+                    history=history, label=label)
         profit = hand.play()
         busted = []
         for k, i in enumerate(alive):
@@ -627,7 +787,8 @@ def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
 
 
 def run_human_tournament(opponents, stack=1000, big_blind=20, level_hands=10, seed=None,
-                         input_fn=input, output_fn=print, name="Vous", leaderboard=None):
+                         input_fn=input, output_fn=print, name="Vous", leaderboard=None,
+                         history=None):
     """Tournoi interactif : l'humain affronte ``opponents`` jusqu'à son élimination ou sa victoire.
 
     Renvoie la place finale de l'humain (1 = vainqueur) ou None s'il abandonne (``q``).
@@ -636,7 +797,8 @@ def run_human_tournament(opponents, stack=1000, big_blind=20, level_hands=10, se
     bots = [human] + list(opponents)
     try:
         ranking = run_tournament(bots, stack, big_blind, level_hands, seed=seed, log=output_fn,
-                                 show_hole=False, stop_when_out=human)
+                                 show_hole=False, stop_when_out=human, history=history,
+                                 label="humain-tournoi")
     except QuitGame:
         output_fn("\nVous avez abandonné le tournoi.")
         return None
@@ -819,7 +981,7 @@ def _handshake(sock, timeout=10):
 
 def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), hands=None,
                tournament=False, stack=None, big_blind=None, level_hands=10, seed=None,
-               timeout=120, on_listen=None, output_fn=print, leaderboard=None):
+               timeout=120, on_listen=None, output_fn=print, leaderboard=None, history=None):
     """Héberge une partie : attend ``players`` joueurs humains, les fait jouer entre eux
     (et contre ``opponents``) puis renvoie les résultats (gains cash ou classement tournoi).
 
@@ -939,7 +1101,7 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
     try:
         if tournament:
             ranking = run_tournament(everyone, stack, big_blind, level_hands, seed=seed, log=broadcast,
-                                     show_hole=False,
+                                     show_hole=False, history=history, label="réseau-tournoi",
                                      should_stop=lambda: all(r.gone for r in remotes))
             broadcast("\nClassement final : " + " > ".join(f"{i}. {n}" for i, n in enumerate(ranking, 1)))
             if leaderboard:
@@ -954,7 +1116,8 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
                 break
             broadcast(f"\n=== Main {played + 1} (blinds {big_blind // 2}/{big_blind}) ===")
             hand = Hand(active, button=played % len(active), stack=stack, big_blind=big_blind,
-                        rng=rng, log=broadcast, show_hole=False)
+                        rng=rng, log=broadcast, show_hole=False, history=history,
+                        label="réseau")
             profits = hand.play()
             for b, p in zip(active, profits):
                 totals[b.name] += p
@@ -1059,7 +1222,7 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard"), default="cash",
+    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay"), default="cash",
                    help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
                         "human : vous jouez contre les bots ; server / client : partie en réseau")
     p.add_argument("--host", default=None,
@@ -1074,6 +1237,14 @@ def main(argv=None):
     p.add_argument("--no-leaderboard", action="store_true", help="ne pas enregistrer les résultats")
     p.add_argument("--min-hands", type=int, default=20,
                    help="mains minimum pour figurer au classement cash affiché")
+    p.add_argument("--history", default=None, metavar="FICHIER",
+                   help="enregistre chaque main jouée dans ce fichier (cash, tournament, human, server) ; "
+                        f"avec --mode replay : fichier à relire (défaut {DEFAULT_HISTORY})")
+    p.add_argument("--hand", type=int, default=None, help="mode replay : numéro de la main (défaut : la dernière)")
+    p.add_argument("--list", action="store_true", help="mode replay : liste les mains enregistrées")
+    p.add_argument("--step", action="store_true", help="mode replay : Entrée pour passer à l'étape suivante")
+    p.add_argument("--delay", type=float, default=0.0, help="mode replay : pause (s) entre deux étapes")
+    p.add_argument("--player", default=None, help="mode replay --list : n'afficher que les mains de ce joueur")
     p.add_argument("--spectate", action="store_true",
                    help="mode client : regarder la partie sans jouer (avant ou pendant)")
     p.add_argument("--players", type=int, default=2, help="joueurs humains attendus (mode server)")
@@ -1085,6 +1256,11 @@ def main(argv=None):
     p.add_argument("--verbose", action="store_true", help="affiche chaque main")
     args = p.parse_args(argv)
 
+    if args.mode == "replay":
+        ok = run_replay(args.history or DEFAULT_HISTORY, args.hand, args.list, args.player,
+                        args.step, args.delay)
+        raise SystemExit(0 if ok else 1)
+    history = HandHistory(args.history) if args.history else None
     board = None if args.no_leaderboard else Leaderboard(args.leaderboard)
     if args.mode == "leaderboard":
         print(Leaderboard(args.leaderboard).format(min_hands=args.min_hands))
@@ -1102,7 +1278,7 @@ def main(argv=None):
                    args.hands if hands_given else None, args.tournament,
                    args.stack if args.stack != 100 else None,
                    args.big_blind if args.big_blind != 2 else None,
-                   args.level_hands, args.seed, args.timeout, leaderboard=board)
+                   args.level_hands, args.seed, args.timeout, leaderboard=board, history=history)
         return
     human = args.mode == "human"
     if not (1 if human else 2) <= len(names) <= (8 if human else 9):
@@ -1111,20 +1287,23 @@ def main(argv=None):
     if args.mode == "human" and args.tournament:
         run_human_tournament(bots, args.stack if args.stack != 100 else 1000,
                              args.big_blind if args.big_blind != 2 else 20,
-                             args.level_hands, args.seed, name=args.name or "Vous", leaderboard=board)
+                             args.level_hands, args.seed, name=args.name or "Vous", leaderboard=board, history=history)
         return
     if args.mode == "human":
         run_human(bots, args.hands if hands_given else None,
-                  args.stack, args.big_blind, args.seed, name=args.name or "Vous", leaderboard=board)
+                  args.stack, args.big_blind, args.seed, name=args.name or "Vous", leaderboard=board,
+                  history=history)
         return
     if args.mode == "tournament":
         stack = args.stack if args.stack != 100 else 1000
         bb = args.big_blind if args.big_blind != 2 else 20
         res = run_tournaments(bots, args.tournaments, starting_stack=stack, big_blind=bb,
-                              level_hands=args.level_hands, seed=args.seed, verbose=args.verbose)
+                              level_hands=args.level_hands, seed=args.seed, verbose=args.verbose,
+                              history=history)
         print_tournament_report(res, args.tournaments)
         return
-    results = run_session(bots, args.hands, args.stack, args.big_blind, args.seed, args.verbose)
+    results = run_session(bots, args.hands, args.stack, args.big_blind, args.seed, args.verbose,
+                          history)
     print_report(results, args.hands)
 
 

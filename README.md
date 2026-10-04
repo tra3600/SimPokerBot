@@ -74,3 +74,15 @@ Les résultats des humains sont cumulés dans un fichier JSON (`classement.json`
 - Cash : classé par gain moyen en grosses blinds pour 100 mains (bb/100), pour les joueurs ayant au moins `--min-hands` mains. Tournois : classé par score moyen (100 % pour un vainqueur, 0 % pour le dernier, quelle que soit la taille de la table), puis par victoires.
 - Le fichier est réécrit de façon atomique à chaque mise à jour et relu avant chaque écriture (plusieurs serveurs peuvent partager le même fichier). S'il est illisible, il est conservé en `.bak` et un nouveau classement démarre.
 - Attention : le pseudo n'est pas authentifié, n'importe qui peut jouer sous le nom d'un autre joueur.
+
+## Replay des mains
+Enregistrer les mains jouées, puis les rejouer avec **toutes** les cartes visibles :
+
+    python SimuPokerBot.py --bots tight,maniac,station --hands 200 --history mains.jsonl
+    python SimuPokerBot.py --mode replay --history mains.jsonl --list
+    python SimuPokerBot.py --mode replay --history mains.jsonl --hand 17 --step
+
+- `--history FICHIER` enregistre chaque main (une ligne JSON par main, en ajout) dans les modes `cash`, `tournament`, `human` et `server`. Rien n'est enregistré sans cette option. Le fichier contient les cartes de tous les joueurs : à garder en local.
+- `--mode replay` relit le fichier (`mains.jsonl` par défaut) : `--list` liste les mains numérotées (joueurs, board, pot, gagnants ; `--player NOM` filtre), `--hand N` rejoue la main N (la dernière par défaut), `--step` avance à chaque Entrée (`q` pour arrêter), `--delay 1.5` marque une pause entre les étapes.
+- Le replay montre pour chaque action le pot courant, les tapis, les cartes montrées au showdown et le résultat net de chacun.
+- Les lignes illisibles du fichier sont ignorées ; le code de sortie est 1 si le replay est impossible (fichier absent, main introuvable).

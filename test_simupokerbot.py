@@ -429,3 +429,101 @@ def test_cli_leaderboard_mode(tmp_path, capsys):
     Leaderboard(path).record_tournament({"alice": (1, 3)})
     main(["--mode", "leaderboard", "--leaderboard", path])
     assert "alice" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Historique / replay
+# --------------------------------------------------------------------------
+def _record_hands(path, n=6, bots=("maniac", "station", "random"), seed=1):
+    from SimuPokerBot import HandHistory
+    run_session(make_bots(list(bots)), hands=n, seed=seed, history=HandHistory(str(path)))
+
+
+def test_history_records_consistent_hands(tmp_path):
+    from SimuPokerBot import load_history
+    path = tmp_path / "h.jsonl"
+    _record_hands(path, n=12)
+    hands = load_history(str(path))
+    assert len(hands) == 12
+    for rec in hands:
+        assert sum(rec["profit"].values()) == 0
+        assert [p["name"] for p in rec["players"]] == ["maniac", "station", "random"]
+        # le pot reconstruit à partir des événements = somme des mises
+        put = sum(e["amt"] for e in rec["events"] if e["e"] in ("blind", "call", "raise"))
+        won = sum(e["amt"] for e in rec["events"] if e["e"] == "win")
+        assert put == won
+        assert rec["events"][0]["e"] == "blind"
+
+
+def test_replay_shows_all_hole_cards_and_result(tmp_path):
+    from SimuPokerBot import load_history, run_replay
+    path = tmp_path / "h.jsonl"
+    _record_hands(path)
+    out = []
+    assert run_replay(str(path), number=2, output_fn=out.append)
+    text = "\n".join(out)
+    rec = load_history(str(path))[1]
+    assert "Main 2" in text and "Résultat" in text
+    from SimuPokerBot import _cards
+    for p in rec["players"]:
+        assert _cards(p["hole"]) in text  # les cartes de tous sont visibles dans un replay
+
+
+def test_replay_default_last_hand_list_and_filter(tmp_path):
+    from SimuPokerBot import run_replay
+    path = tmp_path / "h.jsonl"
+    _record_hands(path, n=4)
+    out = []
+    assert run_replay(str(path), output_fn=out.append)
+    assert "Main 4" in "\n".join(out)
+    out.clear()
+    assert run_replay(str(path), list_only=True, output_fn=out.append)
+    assert len(out) == 4 and out[0].lstrip().startswith("1.")
+    out.clear()
+    assert not run_replay(str(path), list_only=True, player="inconnu", output_fn=out.append)
+    out.clear()
+    assert not run_replay(str(path), number=99, output_fn=out.append)
+    assert "introuvable" in out[0]
+
+
+def test_replay_step_mode_quit(tmp_path):
+    from SimuPokerBot import run_replay
+    path = tmp_path / "h.jsonl"
+    _record_hands(path, n=2)
+    out, answers = [], iter(["", "", "q"])
+    run_replay(str(path), number=1, step=True, output_fn=out.append, input_fn=lambda p="": next(answers))
+    assert len(out) == 3  # trois étapes affichées puis arrêt
+
+
+def test_replay_missing_or_corrupt_file(tmp_path):
+    from SimuPokerBot import run_replay
+    out = []
+    assert not run_replay(str(tmp_path / "absent.jsonl"), output_fn=out.append)
+    assert "Impossible de lire" in out[0]
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text("pas du json\n{\"x\": 1}\n")
+    out.clear()
+    assert not run_replay(str(bad), output_fn=out.append)
+    assert "Aucune main" in out[0]
+
+
+def test_history_tournament_and_human_modes(tmp_path):
+    from SimuPokerBot import HandHistory, load_history, run_human, run_tournament
+    path = tmp_path / "t.jsonl"
+    h = HandHistory(str(path))
+    run_tournament(make_bots(["maniac", "station"]), seed=3, history=h)
+    run_human(make_bots(["station"]), hands=2, seed=1, input_fn=lambda p="": "c",
+              output_fn=lambda *_: None, history=h)
+    hands = load_history(str(path))
+    assert {r["label"] for r in hands} == {"tournoi", "humain"}
+
+
+def test_cli_record_and_replay(tmp_path, capsys):
+    from SimuPokerBot import main
+    path = str(tmp_path / "c.jsonl")
+    main(["--bots", "tight,station", "--hands", "3", "--seed", "2", "--history", path])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        main(["--mode", "replay", "--history", path, "--hand", "1"])
+    assert e.value.code == 0
+    assert "Main 1" in capsys.readouterr().out
