@@ -65,3 +65,12 @@ Un spectateur peut se connecter avant ou pendant la partie (20 au maximum). Il r
 
 ### Chat
 Les joueurs (et eux seuls) peuvent discuter à tout moment, même hors de leur tour : une ligne qui commence par `/` est envoyée au chat, par exemple `/bien joué !`. Toute autre ligne répond à la décision en cours. Le chat est diffusé à tous les joueurs, aux spectateurs et dans la console du serveur sous la forme `[chat] Alice: bien joué !`. Les messages sont limités à 200 caractères et à un message toutes les 0,5 s par joueur ; les caractères de contrôle sont supprimés. Les spectateurs lisent le chat mais ne peuvent pas écrire.
+
+## Classement persistant
+Les résultats des humains sont cumulés dans un fichier JSON (`classement.json` par défaut, option `--leaderboard FICHIER`, désactivable avec `--no-leaderboard`). Les bots n'y figurent pas.
+
+- Enregistrés automatiquement : le mode `server` (cash : une entrée par main ; tournoi : place finale) et les modes `human` / `human --tournament` (sous le pseudo donné par `--name`, « Vous » par défaut). Un tournoi abandonné avec `q` n'est pas compté.
+- Affichage : `python SimuPokerBot.py --mode leaderboard [--min-hands 20]`, et automatiquement à la fin d'une partie en réseau (diffusé aux joueurs et spectateurs).
+- Cash : classé par gain moyen en grosses blinds pour 100 mains (bb/100), pour les joueurs ayant au moins `--min-hands` mains. Tournois : classé par score moyen (100 % pour un vainqueur, 0 % pour le dernier, quelle que soit la taille de la table), puis par victoires.
+- Le fichier est réécrit de façon atomique à chaque mise à jour et relu avant chaque écriture (plusieurs serveurs peuvent partager le même fichier). S'il est illisible, il est conservé en `.bak` et un nouveau classement démarre.
+- Attention : le pseudo n'est pas authentifié, n'importe qui peut jouer sous le nom d'un autre joueur.

@@ -15,6 +15,7 @@ Exemples :
 """
 import argparse
 import json
+import os
 import queue
 import random
 import socket
@@ -444,8 +445,110 @@ def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=Fal
                      "win_rate": wins[b.name] / hands} for b in bots}
 
 
+# --------------------------------------------------------------------------
+# Classement persistant (fichier JSON)
+# --------------------------------------------------------------------------
+DEFAULT_LEADERBOARD = "classement.json"
+_EMPTY_STATS = {"cash_hands": 0, "cash_bb": 0.0, "tournaments": 0, "wins": 0, "place_pct": 0.0}
+
+
+class Leaderboard:
+    """Statistiques cumulées par pseudo, sauvegardées dans un fichier JSON.
+
+    Chaque mise à jour relit le fichier puis le réécrit de façon atomique (fichier temporaire
+    + ``os.replace``) : un plantage ne corrompt pas le classement et plusieurs serveurs
+    peuvent partager le même fichier. Un fichier illisible est mis de côté en ``.bak``."""
+
+    def __init__(self, path=DEFAULT_LEADERBOARD):
+        self.path = path
+        self._lock = threading.Lock()
+        self.players = self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                raw = json.load(f).get("players", {})
+            if not isinstance(raw, dict):
+                raise ValueError("format inattendu")
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError, AttributeError):
+            try:
+                os.replace(self.path, self.path + ".bak")
+            except OSError:
+                pass
+            return {}
+        players = {}
+        for name, entry in raw.items():
+            try:
+                players[str(name)] = {k: type(v)(entry.get(k, v)) for k, v in _EMPTY_STATS.items()}
+            except (AttributeError, TypeError, ValueError):
+                continue  # entrée abîmée : ignorée
+        return players
+
+    def _save(self):
+        tmp = f"{self.path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "players": self.players}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+
+    def _update(self, apply):
+        with self._lock:
+            self.players = self._load()
+            apply()
+            self._save()
+
+    def _entry(self, name):
+        return self.players.setdefault(name, dict(_EMPTY_STATS))
+
+    def record_cash(self, results):
+        """``results`` : {pseudo: gain de la main en grosses blinds}. Une main par pseudo."""
+        def apply():
+            for name, bb in results.items():
+                e = self._entry(name)
+                e["cash_hands"] += 1
+                e["cash_bb"] += bb
+        self._update(apply)
+
+    def record_tournament(self, places):
+        """``places`` : {pseudo: (place, nombre de joueurs)}, place 1 = vainqueur."""
+        def apply():
+            for name, (place, size) in places.items():
+                e = self._entry(name)
+                e["tournaments"] += 1
+                e["wins"] += place == 1
+                e["place_pct"] += (size - place) / (size - 1) if size > 1 else 1.0
+        self._update(apply)
+
+    def format(self, top=10, min_hands=20):
+        with self._lock:
+            self.players = self._load()
+            players = dict(self.players)
+        cash = [(n, e) for n, e in players.items() if e["cash_hands"] >= min_hands]
+        cash.sort(key=lambda ne: -ne[1]["cash_bb"] / ne[1]["cash_hands"])
+        tours = [(n, e) for n, e in players.items() if e["tournaments"]]
+        tours.sort(key=lambda ne: (-ne[1]["place_pct"] / ne[1]["tournaments"], -ne[1]["wins"]))
+        lines = [f"== Classement cash (au moins {min_hands} mains) =="]
+        if cash:
+            lines.append(f"{'#':>2} {'Joueur':<15}{'Mains':>7}{'Gain (bb)':>11}{'bb/100':>9}")
+            for i, (n, e) in enumerate(cash[:top], 1):
+                lines.append(f"{i:>2} {n:<15}{e['cash_hands']:>7}{e['cash_bb']:>11.1f}"
+                             f"{e['cash_bb'] / e['cash_hands'] * 100:>9.1f}")
+        else:
+            lines.append("(aucun joueur n'a encore assez de mains)")
+        lines.append("== Classement tournois (score = 100 % pour un vainqueur, 0 % pour le dernier) ==")
+        if tours:
+            lines.append(f"{'#':>2} {'Joueur':<15}{'Tournois':>9}{'Victoires':>10}{'Score moy.':>11}")
+            for i, (n, e) in enumerate(tours[:top], 1):
+                lines.append(f"{i:>2} {n:<15}{e['tournaments']:>9}{e['wins']:>10}"
+                             f"{e['place_pct'] / e['tournaments']:>11.0%}")
+        else:
+            lines.append("(aucun tournoi joué)")
+        return "\n".join(lines)
+
+
 def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
-              input_fn=input, output_fn=print):
+              input_fn=input, output_fn=print, name="Vous", leaderboard=None):
     """Partie interactive : l'humain (siège 0) contre des bots, tapis remis à ``stack`` à chaque main.
 
     S'arrête après ``hands`` mains (illimité si None) ou quand le joueur tape ``q``.
@@ -454,7 +557,7 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
     rng = random.Random(seed)
     if seed is not None:
         random.seed(seed)
-    human = HumanBot(input_fn=input_fn, output_fn=output_fn)
+    human = HumanBot(name, input_fn=input_fn, output_fn=output_fn)
     bots = [human] + list(opponents)
     net, played = 0, 0
     while hands is None or played < hands:
@@ -467,6 +570,8 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
             break
         net += profit[0]
         played += 1
+        if leaderboard:
+            leaderboard.record_cash({name: profit[0] / big_blind})
         output_fn(f"--- Résultat : {profit[0]:+d} | total : {net:+d} jetons "
                   f"({net / big_blind:+.1f} bb) sur {played} main(s)")
     output_fn(f"\nFin de la partie : {net:+d} jetons ({net / big_blind:+.1f} bb) sur {played} main(s).")
@@ -522,12 +627,12 @@ def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
 
 
 def run_human_tournament(opponents, stack=1000, big_blind=20, level_hands=10, seed=None,
-                         input_fn=input, output_fn=print):
+                         input_fn=input, output_fn=print, name="Vous", leaderboard=None):
     """Tournoi interactif : l'humain affronte ``opponents`` jusqu'à son élimination ou sa victoire.
 
     Renvoie la place finale de l'humain (1 = vainqueur) ou None s'il abandonne (``q``).
     """
-    human = HumanBot(input_fn=input_fn, output_fn=output_fn)
+    human = HumanBot(name, input_fn=input_fn, output_fn=output_fn)
     bots = [human] + list(opponents)
     try:
         ranking = run_tournament(bots, stack, big_blind, level_hands, seed=seed, log=output_fn,
@@ -536,6 +641,8 @@ def run_human_tournament(opponents, stack=1000, big_blind=20, level_hands=10, se
         output_fn("\nVous avez abandonné le tournoi.")
         return None
     place = ranking.index(human.name) + 1
+    if leaderboard:
+        leaderboard.record_tournament({name: (place, len(bots))})
     if place == 1:
         output_fn("\n*** Bravo, vous remportez le tournoi ! ***")
     else:
@@ -712,7 +819,7 @@ def _handshake(sock, timeout=10):
 
 def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), hands=None,
                tournament=False, stack=None, big_blind=None, level_hands=10, seed=None,
-               timeout=120, on_listen=None, output_fn=print):
+               timeout=120, on_listen=None, output_fn=print, leaderboard=None):
     """Héberge une partie : attend ``players`` joueurs humains, les fait jouer entre eux
     (et contre ``opponents``) puis renvoie les résultats (gains cash ou classement tournoi).
 
@@ -835,6 +942,10 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
                                      show_hole=False,
                                      should_stop=lambda: all(r.gone for r in remotes))
             broadcast("\nClassement final : " + " > ".join(f"{i}. {n}" for i, n in enumerate(ranking, 1)))
+            if leaderboard:
+                leaderboard.record_tournament(
+                    {r.name: (ranking.index(r.name) + 1, len(ranking)) for r in remotes})
+                broadcast("\n" + leaderboard.format())
             return ranking
         totals, played = defaultdict(int), 0
         while hands is None or played < hands:
@@ -844,11 +955,17 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
             broadcast(f"\n=== Main {played + 1} (blinds {big_blind // 2}/{big_blind}) ===")
             hand = Hand(active, button=played % len(active), stack=stack, big_blind=big_blind,
                         rng=rng, log=broadcast, show_hole=False)
-            for b, p in zip(active, hand.play()):
+            profits = hand.play()
+            for b, p in zip(active, profits):
                 totals[b.name] += p
+            if leaderboard:
+                leaderboard.record_cash({b.name: p / big_blind for b, p in zip(active, profits)
+                                         if isinstance(b, RemoteBot)})
             played += 1
             broadcast("--- Totaux : " + ", ".join(f"{b.name} {totals[b.name]:+d}" for b in everyone))
         broadcast(f"\nFin de la partie après {played} main(s).")
+        if leaderboard:
+            broadcast("\n" + leaderboard.format())
         return dict(totals)
     finally:
         server.close()
@@ -942,14 +1059,21 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client"), default="cash",
+    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard"), default="cash",
                    help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
                         "human : vous jouez contre les bots ; server / client : partie en réseau")
     p.add_argument("--host", default=None,
                    help="client : adresse du serveur (défaut 127.0.0.1) ; server : adresse d'écoute "
                         "(défaut 127.0.0.1, utilisez 0.0.0.0 pour le réseau local)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.add_argument("--name", default="Joueur", help="votre pseudo (mode client)")
+    p.add_argument("--name", default=None,
+                   help="votre pseudo (client : 'Joueur' par défaut ; human : 'Vous', clé du classement)")
+    p.add_argument("--leaderboard", default=DEFAULT_LEADERBOARD, metavar="FICHIER",
+                   help=f"fichier du classement persistant (défaut {DEFAULT_LEADERBOARD}) ; "
+                        "utilisé par les modes server et human, et affiché par --mode leaderboard")
+    p.add_argument("--no-leaderboard", action="store_true", help="ne pas enregistrer les résultats")
+    p.add_argument("--min-hands", type=int, default=20,
+                   help="mains minimum pour figurer au classement cash affiché")
     p.add_argument("--spectate", action="store_true",
                    help="mode client : regarder la partie sans jouer (avant ou pendant)")
     p.add_argument("--players", type=int, default=2, help="joueurs humains attendus (mode server)")
@@ -961,9 +1085,13 @@ def main(argv=None):
     p.add_argument("--verbose", action="store_true", help="affiche chaque main")
     args = p.parse_args(argv)
 
+    board = None if args.no_leaderboard else Leaderboard(args.leaderboard)
+    if args.mode == "leaderboard":
+        print(Leaderboard(args.leaderboard).format(min_hands=args.min_hands))
+        return
     hands_given = "--hands" in (argv if argv is not None else sys.argv)
     if args.mode == "client":
-        run_client(args.host or "127.0.0.1", args.port, args.name, spectate=args.spectate)
+        run_client(args.host or "127.0.0.1", args.port, args.name or "Joueur", spectate=args.spectate)
         return
     raw = args.bots if args.bots is not None else ("" if args.mode == "server" else "tight,equity,loose,station")
     names = [n.strip() for n in raw.split(",") if n.strip()]
@@ -974,7 +1102,7 @@ def main(argv=None):
                    args.hands if hands_given else None, args.tournament,
                    args.stack if args.stack != 100 else None,
                    args.big_blind if args.big_blind != 2 else None,
-                   args.level_hands, args.seed, args.timeout)
+                   args.level_hands, args.seed, args.timeout, leaderboard=board)
         return
     human = args.mode == "human"
     if not (1 if human else 2) <= len(names) <= (8 if human else 9):
@@ -983,11 +1111,11 @@ def main(argv=None):
     if args.mode == "human" and args.tournament:
         run_human_tournament(bots, args.stack if args.stack != 100 else 1000,
                              args.big_blind if args.big_blind != 2 else 20,
-                             args.level_hands, args.seed)
+                             args.level_hands, args.seed, name=args.name or "Vous", leaderboard=board)
         return
     if args.mode == "human":
         run_human(bots, args.hands if hands_given else None,
-                  args.stack, args.big_blind, args.seed)
+                  args.stack, args.big_blind, args.seed, name=args.name or "Vous", leaderboard=board)
         return
     if args.mode == "tournament":
         stack = args.stack if args.stack != 100 else 1000

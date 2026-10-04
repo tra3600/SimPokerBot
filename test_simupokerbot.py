@@ -332,3 +332,100 @@ def test_late_player_is_rejected():
     assert "déjà commencée" in c.recv(5)["text"]
     c.close()
     srv.join(30)
+
+
+# --------------------------------------------------------------------------
+# Classement persistant
+# --------------------------------------------------------------------------
+def test_leaderboard_persists_between_instances(tmp_path):
+    from SimuPokerBot import Leaderboard
+    path = tmp_path / "lb.json"
+    lb = Leaderboard(str(path))
+    lb.record_cash({"alice": 5.0, "bob": -5.0})
+    lb.record_cash({"alice": -1.0})
+    lb.record_tournament({"alice": (1, 4), "bob": (4, 4)})
+    again = Leaderboard(str(path))
+    a, b = again.players["alice"], again.players["bob"]
+    assert a["cash_hands"] == 2 and a["cash_bb"] == 4.0
+    assert a["tournaments"] == 1 and a["wins"] == 1 and a["place_pct"] == 1.0
+    assert b["place_pct"] == 0.0 and b["wins"] == 0
+    text = again.format(min_hands=1)
+    assert text.index("alice") < text.index("bob")
+
+
+def test_leaderboard_min_hands_and_empty(tmp_path):
+    from SimuPokerBot import Leaderboard
+    lb = Leaderboard(str(tmp_path / "x.json"))
+    assert "aucun joueur" in lb.format() and "aucun tournoi" in lb.format()
+    lb.record_cash({"alice": 1.0})
+    assert "alice" not in lb.format(min_hands=20)
+    assert "alice" in lb.format(min_hands=1)
+
+
+def test_leaderboard_corrupt_file_is_set_aside(tmp_path):
+    from SimuPokerBot import Leaderboard
+    path = tmp_path / "lb.json"
+    path.write_text("{ pas du json")
+    lb = Leaderboard(str(path))
+    assert lb.players == {}
+    assert (tmp_path / "lb.json.bak").exists()
+    lb.record_cash({"alice": 1.0})
+    assert Leaderboard(str(path)).players["alice"]["cash_hands"] == 1
+
+
+def test_leaderboard_ignores_malformed_entries_and_merges_external_writes(tmp_path):
+    import json
+    from SimuPokerBot import Leaderboard
+    path = tmp_path / "lb.json"
+    path.write_text(json.dumps({"players": {"ok": {"cash_hands": 3, "cash_bb": 1.5}, "bad": 7}}))
+    lb = Leaderboard(str(path))
+    assert set(lb.players) == {"ok"} and lb.players["ok"]["wins"] == 0
+    # un autre processus écrit entre-temps : la mise à jour suivante ne l'écrase pas
+    other = Leaderboard(str(path))
+    other.record_cash({"zoe": 2.0})
+    lb.record_cash({"ok": 1.0})
+    final = Leaderboard(str(path)).players
+    assert final["zoe"]["cash_hands"] == 1 and final["ok"]["cash_hands"] == 4
+
+
+def test_human_modes_record_results(tmp_path):
+    from SimuPokerBot import Leaderboard, run_human, run_human_tournament
+    lb = Leaderboard(str(tmp_path / "lb.json"))
+    run_human(make_bots(["station"]), hands=3, seed=1, name="Zoe", leaderboard=lb,
+              input_fn=lambda prompt="": "c", output_fn=lambda *_: None)
+    assert Leaderboard(lb.path).players["Zoe"]["cash_hands"] == 3
+    place = run_human_tournament(make_bots(["station"]), seed=2, name="Zoe", leaderboard=lb,
+                                 input_fn=lambda prompt="": "a" if "a = tapis" in prompt else "c",
+                                 output_fn=lambda *_: None)
+    e = Leaderboard(lb.path).players["Zoe"]
+    assert e["tournaments"] == 1 and e["wins"] == (place == 1)
+    # abandon : rien n'est enregistré pour le tournoi
+    assert run_human_tournament(make_bots(["station"]), seed=2, name="Zoe", leaderboard=lb,
+                                input_fn=lambda prompt="": "q", output_fn=lambda *_: None) is None
+    assert Leaderboard(lb.path).players["Zoe"]["tournaments"] == 1
+
+
+def test_network_games_update_leaderboard_for_humans_only(tmp_path):
+    from SimuPokerBot import Leaderboard
+    lb = Leaderboard(str(tmp_path / "lb.json"))
+    call = lambda prompt="": "c"
+    _, out = _play_network({"alice": call, "bob": call}, hands=3, seed=1,
+                           opponents=make_bots(["station"]), leaderboard=lb)
+    players = Leaderboard(lb.path).players
+    assert set(players) == {"alice", "bob"}  # les bots ne figurent pas au classement
+    assert players["alice"]["cash_hands"] == 3
+    assert any("Classement cash" in l for l in out["alice"])
+
+    shove = lambda prompt="": "a" if "a = tapis" in prompt else "c"
+    _, out = _play_network({"alice": shove, "bob": shove}, tournament=True, seed=3, leaderboard=lb)
+    players = Leaderboard(lb.path).players
+    assert players["alice"]["tournaments"] == 1 and players["bob"]["tournaments"] == 1
+    assert players["alice"]["wins"] + players["bob"]["wins"] == 1
+
+
+def test_cli_leaderboard_mode(tmp_path, capsys):
+    from SimuPokerBot import Leaderboard, main
+    path = str(tmp_path / "lb.json")
+    Leaderboard(path).record_tournament({"alice": (1, 3)})
+    main(["--mode", "leaderboard", "--leaderboard", path])
+    assert "alice" in capsys.readouterr().out
