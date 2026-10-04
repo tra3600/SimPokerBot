@@ -22,3 +22,9 @@ Créer une sous-classe de `Bot` avec `act(view)` renvoyant `("fold"|"call"|"rais
 
 ## Tests
     pytest
+
+## Mode tournoi
+    python SimuPokerBot.py --mode tournament --tournaments 20 --seed 1
+    python SimuPokerBot.py --mode tournament --bots tight,maniac,station --verbose
+
+Tapis initial 1000 et blinds 10/20 par défaut (`--stack`, `--big-blind`). Les blinds augmentent de 50 % toutes les `--level-hands` mains (10 par défaut). Les joueurs à 0 jeton sont éliminés ; le rapport donne les victoires et la place moyenne de chaque bot sur `--tournaments` tournois.

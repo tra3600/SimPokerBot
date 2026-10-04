@@ -76,3 +76,17 @@ def test_session_and_strategies():
 def test_unknown_strategy():
     with pytest.raises(ValueError):
         make_bots(["nope"])
+
+
+def test_tournament_has_single_winner_and_full_ranking():
+    bots = make_bots(["maniac", "station", "random", "equity"])
+    from SimuPokerBot import run_tournament
+    ranking = run_tournament(bots, seed=5)
+    assert sorted(ranking) == sorted(b.name for b in bots)
+
+
+def test_tournaments_stats():
+    from SimuPokerBot import run_tournaments
+    res = run_tournaments(make_bots(["maniac", "station", "random"]), count=3, seed=1)
+    assert sum(r["wins"] for r in res.values()) == 3
+    assert abs(sum(r["avg_place"] for r in res.values()) - 6) < 1e-9

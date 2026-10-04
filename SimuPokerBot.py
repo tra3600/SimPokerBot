@@ -9,6 +9,7 @@ Fonctionnalités :
 Exemples :
     python SimuPokerBot.py --hands 2000 --seed 1
     python SimuPokerBot.py --bots tight,maniac,station,random --hands 500 --verbose
+    python SimuPokerBot.py --mode tournament --tournaments 20 --seed 1
 """
 import argparse
 import random
@@ -208,7 +209,7 @@ class Hand:
         self.bots, self.n = bots, len(bots)
         self.button, self.bb, self.rng = button, big_blind, rng
         self.log = log or (lambda *_: None)
-        self.stack = [stack] * self.n
+        self.stack = list(stack) if isinstance(stack, (list, tuple)) else [stack] * self.n
         self.start = list(self.stack)
         self.total = [0] * self.n      # mise totale dans la main
         self.bet = [0] * self.n        # mise sur la street courante
@@ -377,6 +378,67 @@ def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=Fal
                      "win_rate": wins[b.name] / hands} for b in bots}
 
 
+def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
+                   blind_growth=1.5, max_hands=1000, seed=None, verbose=False):
+    """Joue un tournoi jusqu'à ce qu'il reste un joueur.
+
+    Les blinds augmentent de ``blind_growth`` toutes les ``level_hands`` mains.
+    Renvoie la liste des noms classés du vainqueur au premier éliminé.
+    """
+    rng = random.Random(seed)
+    if seed is not None:
+        random.seed(seed)
+    stacks = {i: starting_stack for i in range(len(bots))}
+    out = []  # éliminés, du premier au dernier
+    button, bb, hand_no = 0, big_blind, 0
+    log = print if verbose else None
+    while len(stacks) > 1 and hand_no < max_hands:
+        alive = list(stacks)
+        if hand_no and hand_no % level_hands == 0:
+            bb = max(bb + 2, int(bb * blind_growth)) // 2 * 2
+        if verbose:
+            print(f"\n=== Main {hand_no + 1} (blinds {bb // 2}/{bb}) ===")
+        button %= len(alive)
+        hand = Hand([bots[i] for i in alive], button=button,
+                    stack=[stacks[i] for i in alive], big_blind=bb, rng=rng, log=log)
+        profit = hand.play()
+        busted = []
+        for k, i in enumerate(alive):
+            stacks[i] += profit[k]
+            if stacks[i] <= 0:
+                busted.append(i)
+        # Plusieurs éliminations sur la même main : le plus petit tapis de départ sort en premier.
+        for i in sorted(busted, key=lambda j: hand.start[alive.index(j)]):
+            del stacks[i]
+            out.append(i)
+            if verbose:
+                print(f"  *** {bots[i].name} est éliminé ({len(stacks) + 1}e)")
+        button = (button + 1) % max(len(stacks), 1)
+        hand_no += 1
+    # Si max_hands atteint : classement par tapis restant.
+    out += sorted(stacks, key=lambda j: stacks[j])
+    return [bots[i].name for i in reversed(out)]
+
+
+def run_tournaments(bots, count=1, **kwargs):
+    """Répète des tournois ; renvoie victoires et place moyenne par bot."""
+    seed = kwargs.pop("seed", None)
+    wins, places = defaultdict(int), defaultdict(int)
+    for t in range(count):
+        ranking = run_tournament(bots, seed=None if seed is None else seed + t, **kwargs)
+        wins[ranking[0]] += 1
+        for place, name in enumerate(ranking, 1):
+            places[name] += place
+    return {b.name: {"wins": wins[b.name], "avg_place": places[b.name] / count} for b in bots}
+
+
+def print_tournament_report(results, count):
+    print(f"\nRésultats sur {count} tournoi(s)")
+    print(f"{'Bot':<10}{'Victoires':>11}{'Place moy.':>12}")
+    for name, r in sorted(results.items(), key=lambda kv: kv[1]["avg_place"]):
+        print(f"{name:<10}{r['wins']:>11}{r['avg_place']:>12.2f}")
+
+
 def print_report(results, hands):
     print(f"\nRésultats sur {hands} mains")
     print(f"{'Bot':<10}{'Gain (jetons)':>15}{'Gain (bb)':>12}{'bb/100':>10}{'Mains gagnées':>16}")
@@ -392,6 +454,10 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--mode", choices=("cash", "tournament"), default="cash",
+                   help="cash : tapis remis à zéro à chaque main ; tournament : élimination")
+    p.add_argument("--tournaments", type=int, default=1, help="nombre de tournois (mode tournament)")
+    p.add_argument("--level-hands", type=int, default=10, help="mains par niveau de blinds (tournoi)")
     p.add_argument("--verbose", action="store_true", help="affiche chaque main")
     args = p.parse_args(argv)
 
@@ -399,6 +465,13 @@ def main(argv=None):
     if not 2 <= len(names) <= 9:
         p.error("il faut entre 2 et 9 bots")
     bots = make_bots(names)
+    if args.mode == "tournament":
+        stack = args.stack if args.stack != 100 else 1000
+        bb = args.big_blind if args.big_blind != 2 else 20
+        res = run_tournaments(bots, args.tournaments, starting_stack=stack, big_blind=bb,
+                              level_hands=args.level_hands, seed=args.seed, verbose=args.verbose)
+        print_tournament_report(res, args.tournaments)
+        return
     results = run_session(bots, args.hands, args.stack, args.big_blind, args.seed, args.verbose)
     print_report(results, args.hands)
 
