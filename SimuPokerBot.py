@@ -821,6 +821,228 @@ def run_replay(path, number=None, list_only=False, player=None, step=False, dela
 
 
 # --------------------------------------------------------------------------
+# Statistiques avancées (calculées à partir de l'historique des mains)
+# --------------------------------------------------------------------------
+SMALL_SAMPLE = 30  # en dessous, les pourcentages sont signalés par une étoile
+_COUNTERS = ("hands", "net_bb", "vpip", "pfr", "threebet_opp", "threebet", "aggr", "calls",
+             "cbet_opp", "cbet", "saw_flop", "showdowns", "showdown_wins")
+
+
+def _new_counters():
+    return {k: 0 for k in _COUNTERS} | {"net_bb": 0.0, "positions": {}, "starting": {}}
+
+
+def position_name(offset, n):
+    """Position à partir du décalage avec le bouton (0 = bouton)."""
+    if n == 2:
+        return "BTN/SB" if offset == 0 else "BB"
+    if offset < 3:
+        return ("BTN", "SB", "BB")[offset]
+    return "CO" if offset == n - 1 else "EP/MP"
+
+
+def starting_hand_key(hole):
+    """« AKs », « 77 », « T9o » : catégorie d'une main de départ."""
+    a, b = sorted(hole, key=lambda c: "23456789TJQKA".index(c[0]), reverse=True)
+    if a[0] == b[0]:
+        return a[0] + b[0]
+    return a[0] + b[0] + ("s" if a[1] == b[1] else "o")
+
+
+def analyze_hand(rec, stats):
+    """Ajoute les compteurs d'une main enregistrée à ``stats`` (dict pseudo -> compteurs)."""
+    names = [p["name"] for p in rec["players"]]
+    n, bb = len(names), rec["bb"]
+    button = names.index(rec["button"]) if rec["button"] in names else 0
+    for i, p in enumerate(rec["players"]):
+        c = stats.setdefault(p["name"], _new_counters())
+        c["hands"] += 1
+        c["net_bb"] += rec["profit"].get(p["name"], 0) / bb
+        pos = c["positions"].setdefault(position_name((i - button) % n, n), [0, 0.0])
+        pos[0] += 1
+        pos[1] += rec["profit"].get(p["name"], 0) / bb
+        st = c["starting"].setdefault(starting_hand_key(p["hole"]), [0, 0.0])
+        st[0] += 1
+        st[1] += rec["profit"].get(p["name"], 0) / bb
+
+    street, raises_pre, last_raiser = "preflop", 0, None
+    vpip, pfr, opp3, folded_pre, saw_flop = set(), set(), set(), set(), set()
+    flop_raised, cbet_seen = False, set()
+    shown, won = set(), set()
+    for e in rec["events"]:
+        kind = e["e"]
+        if kind == "street":
+            street = e["street"]
+            if street == "flop":
+                saw_flop = set(names) - folded_pre
+            continue
+        if kind == "show":
+            shown.add(e["p"])
+            continue
+        if kind == "win" and e["amt"] > 0:
+            won.add(e["p"])
+            continue
+        if kind not in ("fold", "check", "call", "raise"):
+            continue
+        p, c = e["p"], stats[e["p"]]
+        if street == "preflop":
+            if kind == "fold":
+                folded_pre.add(p)
+            if raises_pre == 1 and p not in opp3:  # première décision face à une seule relance
+                opp3.add(p)
+                c["threebet_opp"] += 1
+                c["threebet"] += kind == "raise"
+            if kind in ("call", "raise"):
+                vpip.add(p)
+            if kind == "raise":
+                pfr.add(p)
+                raises_pre += 1
+                last_raiser = p
+        else:
+            if kind == "raise":
+                c["aggr"] += 1
+            elif kind == "call":
+                c["calls"] += 1
+            if street == "flop":
+                if p == last_raiser and p not in cbet_seen and not flop_raised:
+                    cbet_seen.add(p)
+                    c["cbet_opp"] += 1
+                    c["cbet"] += kind == "raise"
+                if kind == "raise":
+                    flop_raised = True
+    for p in vpip:
+        stats[p]["vpip"] += 1
+    for p in pfr:
+        stats[p]["pfr"] += 1
+    for p in saw_flop:
+        stats[p]["saw_flop"] += 1
+    for p in shown:
+        stats[p]["showdowns"] += 1
+        stats[p]["showdown_wins"] += p in won
+
+
+def compute_stats(hands, label=None):
+    stats = {}
+    for rec in hands:
+        if label is None or rec.get("label") == label:
+            analyze_hand(rec, stats)
+    return stats
+
+
+def _pct(num, den):
+    return num / den if den else None
+
+
+def derive(c):
+    """Pourcentages et ratios usuels (None quand le dénominateur est nul)."""
+    return {
+        "hands": c["hands"], "net_bb": c["net_bb"],
+        "bb_per_100": c["net_bb"] / c["hands"] * 100 if c["hands"] else None,
+        "vpip": _pct(c["vpip"], c["hands"]), "pfr": _pct(c["pfr"], c["hands"]),
+        "threebet": _pct(c["threebet"], c["threebet_opp"]),
+        "af": c["aggr"] / c["calls"] if c["calls"] else (float("inf") if c["aggr"] else None),
+        "cbet": _pct(c["cbet"], c["cbet_opp"]),
+        "wtsd": _pct(c["showdowns"], c["saw_flop"]),
+        "wsd": _pct(c["showdown_wins"], c["showdowns"]),
+    }
+
+
+def player_style(d):
+    """Étiquette de style de jeu (indicative, à partir de 30 mains)."""
+    if d["hands"] < SMALL_SAMPLE or d["vpip"] is None:
+        return "échantillon trop petit"
+    vpip, pfr = d["vpip"], d["pfr"] or 0.0
+    if vpip < 0.22:
+        return "TAG (serré-agressif)" if pfr >= 0.6 * vpip else "Rock (serré-passif)"
+    if vpip >= 0.45 and pfr >= 0.25:
+        return "Maniaque"
+    if vpip >= 0.28:
+        return "LAG (large-agressif)" if pfr >= 0.18 else "Calling station"
+    return "Régulier"
+
+
+def _fmt_pct(v, small=False):
+    return "-" if v is None else f"{v:.0%}" + ("*" if small else "")
+
+
+def _fmt_af(v):
+    return "-" if v is None else ("inf" if v == float("inf") else f"{v:.1f}")
+
+
+def format_stats_table(stats):
+    rows = sorted(stats.items(), key=lambda kv: -derive(kv[1])["net_bb"] / max(kv[1]["hands"], 1))
+    lines = [f"{'Joueur':<12}{'Mains':>6}{'VPIP':>6}{'PFR':>6}{'3bet':>6}{'AF':>5}{'CBet':>6}"
+             f"{'WTSD':>6}{'W$SD':>6}{'bb/100':>8}  Profil"]
+    for name, c in rows:
+        d = derive(c)
+        small = d["hands"] < SMALL_SAMPLE
+        lines.append(f"{name:<12}{d['hands']:>6}{_fmt_pct(d['vpip'], small):>6}"
+                     f"{_fmt_pct(d['pfr'], small):>6}{_fmt_pct(d['threebet']):>6}{_fmt_af(d['af']):>5}"
+                     f"{_fmt_pct(d['cbet']):>6}{_fmt_pct(d['wtsd']):>6}{_fmt_pct(d['wsd']):>6}"
+                     f"{d['bb_per_100']:>8.1f}  {player_style(d)}")
+    lines.append("")
+    lines.append("VPIP : mains jouées volontairement | PFR : relances préflop | 3bet : relance face à une "
+                 "relance | AF : (relances)/(calls) postflop | CBet : mise au flop du dernier relanceur "
+                 f"préflop | WTSD : showdowns/flops vus | W$SD : showdowns gagnés | * : moins de {SMALL_SAMPLE} mains")
+    return "\n".join(lines)
+
+
+def format_player_profile(name, c, starting_hands=False, min_samples=3):
+    d = derive(c)
+    lines = [f"=== Profil de {name} ===",
+             f"Mains : {d['hands']} | gain net : {d['net_bb']:+.1f} bb | {d['bb_per_100']:+.1f} bb/100",
+             f"Style : {player_style(d)}",
+             f"VPIP {_fmt_pct(d['vpip'])} | PFR {_fmt_pct(d['pfr'])} | 3bet {_fmt_pct(d['threebet'])} "
+             f"({c['threebet']}/{c['threebet_opp']}) | AF {_fmt_af(d['af'])} "
+             f"({c['aggr']} relances / {c['calls']} calls)",
+             f"Flops vus {_fmt_pct(_pct(c['saw_flop'], c['hands']))} | CBet {_fmt_pct(d['cbet'])} "
+             f"({c['cbet']}/{c['cbet_opp']}) | WTSD {_fmt_pct(d['wtsd'])} | W$SD {_fmt_pct(d['wsd'])} "
+             f"({c['showdown_wins']}/{c['showdowns']})",
+             "", "Par position :"]
+    order = ["BTN/SB", "BTN", "SB", "BB", "CO", "EP/MP"]
+    for pos in sorted(c["positions"], key=order.index):
+        n, net = c["positions"][pos]
+        lines.append(f"  {pos:<7}{n:>5} mains {net:>+8.1f} bb {net / n * 100:>+8.1f} bb/100")
+    if starting_hands:
+        cats = [(k, v) for k, v in c["starting"].items() if v[0] >= min_samples]
+        lines += ["", f"Mains de départ (au moins {min_samples} fois) :"]
+        if not cats:
+            lines.append("  (pas assez de données)")
+        for k, (n, net) in sorted(cats, key=lambda kv: -kv[1][1] / kv[1][0]):
+            lines.append(f"  {k:<5}{n:>5} fois {net:>+8.1f} bb {net / n:>+7.2f} bb/main")
+    return "\n".join(lines)
+
+
+def run_stats(path, player=None, label=None, starting_hands=False, as_json=False,
+              min_samples=3, output_fn=print):
+    """Mode statistiques : tableau comparatif, ou profil détaillé d'un joueur (``player``)."""
+    try:
+        hands = load_history(path)
+    except OSError as err:
+        output_fn(f"Impossible de lire l'historique {path} : {err.strerror or err}")
+        return False
+    stats = compute_stats(hands, label)
+    if not stats:
+        output_fn("Aucune main à analyser" + (f" pour le libellé {label!r}." if label else "."))
+        return False
+    if player is not None and player not in stats:
+        output_fn(f"Joueur {player!r} introuvable. Joueurs connus : {', '.join(sorted(stats))}")
+        return False
+    if as_json:
+        picked = {player: stats[player]} if player else stats
+        output_fn(json.dumps({n: {**c, **derive(c)} for n, c in picked.items()},
+                             ensure_ascii=False, indent=1, default=str))
+    elif player:
+        output_fn(format_player_profile(player, stats[player], starting_hands, min_samples))
+    else:
+        output_fn(f"Statistiques sur {len(hands) if label is None else sum(1 for r in hands if r.get('label') == label)} main(s)\n")
+        output_fn(format_stats_table(stats))
+        if starting_hands:
+            output_fn("\nAstuce : ajoutez --player NOM pour le détail par position et par main de départ.")
+    return True
+
+
+# --------------------------------------------------------------------------
 # Classement persistant (fichier JSON)
 # --------------------------------------------------------------------------
 DEFAULT_LEADERBOARD = "classement.json"
@@ -1439,7 +1661,7 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay", "training"), default="cash",
+    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay", "training", "stats"), default="cash",
                    help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
                         "human : vous jouez contre les bots ; server / client : partie en réseau")
     p.add_argument("--host", default=None,
@@ -1461,7 +1683,13 @@ def main(argv=None):
     p.add_argument("--list", action="store_true", help="mode replay : liste les mains enregistrées")
     p.add_argument("--step", action="store_true", help="mode replay : Entrée pour passer à l'étape suivante")
     p.add_argument("--delay", type=float, default=0.0, help="mode replay : pause (s) entre deux étapes")
-    p.add_argument("--player", default=None, help="mode replay --list : n'afficher que les mains de ce joueur")
+    p.add_argument("--player", default=None, help="modes replay --list et stats : se limiter à ce joueur")
+    p.add_argument("--label", default=None, help="mode stats : ne garder que ce type de partie "
+                   "(cash, tournoi, humain, humain-tournoi, réseau, réseau-tournoi)")
+    p.add_argument("--starting-hands", action="store_true",
+                   help="mode stats --player : détaille les résultats par main de départ (AKs, 77...)")
+    p.add_argument("--min-samples", type=int, default=3, help="mode stats : occurrences minimum par main de départ")
+    p.add_argument("--json", action="store_true", help="mode stats : sortie JSON")
     p.add_argument("--advice", choices=ADVICE_MODES, default="always",
                    help="mode training : always = conseil avant chaque décision, ask = sur demande (?), "
                         "off = seulement le retour après coup")
@@ -1479,6 +1707,10 @@ def main(argv=None):
     if args.mode == "replay":
         ok = run_replay(args.history or DEFAULT_HISTORY, args.hand, args.list, args.player,
                         args.step, args.delay)
+        raise SystemExit(0 if ok else 1)
+    if args.mode == "stats":
+        ok = run_stats(args.history or DEFAULT_HISTORY, args.player, args.label, args.starting_hands,
+                       args.json, args.min_samples)
         raise SystemExit(0 if ok else 1)
     history = HandHistory(args.history) if args.history else None
     board = None if args.no_leaderboard else Leaderboard(args.leaderboard)

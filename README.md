@@ -98,3 +98,16 @@ Comme le mode humain (mêmes commandes), mais avec un coach :
 - À la fin (`q` ou `--hands N`) : bilan avec le % de décisions conformes, le nombre d'erreurs claires, l'espérance perdue en jetons/bb et vos 3 pires erreurs (main, tour, cartes).
 
 Limites : l'équité est calculée contre des mains aléatoires et l'EV ne regarde que la main en cours (pas de cotes implicites, de bluff ni de lecture de l'adversaire). Le conseil est un repère pédagogique, pas un solveur. Les résultats de l'entraînement ne sont pas enregistrés au classement.
+
+## Statistiques avancées
+Analyse d'un historique enregistré avec `--history` (voir Replay) :
+
+    python SimuPokerBot.py --mode stats --history mains.jsonl
+    python SimuPokerBot.py --mode stats --history mains.jsonl --player Alice --starting-hands
+    python SimuPokerBot.py --mode stats --history mains.jsonl --label cash --json
+
+Le tableau comparatif donne, par joueur : mains, **VPIP** (mains jouées volontairement), **PFR** (relances préflop), **3bet** (relance face à une relance), **AF** (relances / calls après le flop), **CBet** (mise au flop du dernier relanceur préflop), **WTSD** (showdowns / flops vus), **W$SD** (showdowns gagnés), **bb/100** et un **profil** indicatif (TAG, Rock, LAG, Calling station, Maniaque) à partir de 30 mains. Les pourcentages calculés sur moins de 30 mains sont suivis d'une étoile.
+
+Avec `--player NOM` : profil détaillé avec les numérateurs/dénominateurs, les résultats **par position** (BTN, SB, BB, CO, EP/MP) et, avec `--starting-hands`, par **main de départ** (AKs, 77, T9o… au moins `--min-samples` fois). `--label` restreint à un type de partie (`cash`, `tournoi`, `humain`, `réseau`…), `--json` sort les compteurs et ratios pour un traitement externe. Code de sortie 1 si l'analyse est impossible (fichier absent, joueur inconnu).
+
+Les stats portent sur les mains enregistrées seulement, et les échantillons de quelques centaines de mains restent très bruités.

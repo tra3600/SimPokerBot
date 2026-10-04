@@ -623,3 +623,132 @@ def test_cli_training_mode(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO("c\n" * 50))
     main(["--mode", "training", "--bots", "station", "--hands", "2", "--seed", "4", "--advice", "off"])
     assert "Bilan d'entraînement" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Statistiques avancées
+# --------------------------------------------------------------------------
+def fake_hand(events, profit, hole=(("As", "Kd"), ("7c", "2h")), button="A", bb=2, label="cash"):
+    names = ["A", "B"]
+    return {"label": label, "bb": bb, "button": button, "board": [],
+            "players": [{"name": n, "stack": 100, "hole": list(h)} for n, h in zip(names, hole)],
+            "events": events, "profit": profit}
+
+
+def test_position_and_starting_hand_helpers():
+    from SimuPokerBot import position_name, starting_hand_key
+    assert [position_name(i, 2) for i in (0, 1)] == ["BTN/SB", "BB"]
+    assert [position_name(i, 6) for i in range(6)] == ["BTN", "SB", "BB", "EP/MP", "EP/MP", "CO"]
+    assert starting_hand_key(["Kd", "As"]) == "AKo"
+    assert starting_hand_key(["Ks", "As"]) == "AKs"
+    assert starting_hand_key(["7c", "7h"]) == "77"
+
+
+def test_stats_counters_on_scripted_hand():
+    from SimuPokerBot import analyze_hand, derive
+    ev = [
+        {"e": "blind", "p": "A", "amt": 1, "role": "SB"}, {"e": "blind", "p": "B", "amt": 2, "role": "BB"},
+        {"e": "raise", "p": "A", "to": 6, "amt": 5, "allin": False},   # PFR + VPIP de A
+        {"e": "raise", "p": "B", "to": 18, "amt": 16, "allin": False},  # 3bet de B
+        {"e": "call", "p": "A", "amt": 12, "allin": False},
+        {"e": "street", "street": "flop", "board": ["2c", "7d", "9h"]},
+        {"e": "check", "p": "B", "amt": 0, "allin": False},
+        {"e": "raise", "p": "A", "to": 10, "amt": 10, "allin": False},  # pas de c-bet : A n'est plus dernier relanceur
+        {"e": "call", "p": "B", "amt": 10, "allin": False},
+        {"e": "show", "p": "A", "cards": ["As", "Kd"], "hand": "High Card"},
+        {"e": "show", "p": "B", "cards": ["7c", "2h"], "hand": "Two Pair"},
+        {"e": "win", "p": "B", "amt": 56},
+    ]
+    stats = {}
+    analyze_hand(fake_hand(ev, {"A": -28, "B": 28}), stats)
+    a, b = derive(stats["A"]), derive(stats["B"])
+    assert a["vpip"] == 1 and a["pfr"] == 1 and a["threebet"] is None
+    assert b["vpip"] == 1 and b["pfr"] == 1 and b["threebet"] == 1.0
+    assert a["wtsd"] == 1 and a["wsd"] == 0 and b["wsd"] == 1
+    assert a["af"] == float("inf") and b["af"] == 0.0  # A : 1 relance / 0 call ; B : 0 / 1
+    assert a["bb_per_100"] == -1400 and b["bb_per_100"] == 1400
+    # B est le dernier relanceur préflop et agit en premier au flop : check => opportunité de c-bet manquée
+    assert stats["B"]["cbet_opp"] == 1 and stats["B"]["cbet"] == 0
+    assert stats["A"]["cbet_opp"] == 0
+    assert stats["A"]["positions"]["BTN/SB"] == [1, -14.0] and stats["B"]["positions"]["BB"] == [1, 14.0]
+
+
+def test_stats_cbet_and_bb_check_not_vpip():
+    from SimuPokerBot import analyze_hand, derive
+    ev = [
+        {"e": "blind", "p": "A", "amt": 1, "role": "SB"}, {"e": "blind", "p": "B", "amt": 2, "role": "BB"},
+        {"e": "raise", "p": "A", "to": 6, "amt": 5, "allin": False},
+        {"e": "call", "p": "B", "amt": 4, "allin": False},
+        {"e": "street", "street": "flop", "board": ["2c", "7d", "9h"]},
+        {"e": "check", "p": "B", "amt": 0, "allin": False},
+        {"e": "raise", "p": "A", "to": 6, "amt": 6, "allin": False},   # c-bet de A
+        {"e": "fold", "p": "B"},
+        {"e": "win", "p": "A", "amt": 16},
+    ]
+    stats = {}
+    analyze_hand(fake_hand(ev, {"A": 6, "B": -6}), stats)
+    assert derive(stats["A"])["cbet"] == 1.0 and derive(stats["B"])["cbet"] is None
+    # BB qui ne fait que checker préflop n'est pas compté au VPIP
+    stats = {}
+    ev2 = [{"e": "blind", "p": "A", "amt": 1, "role": "SB"}, {"e": "blind", "p": "B", "amt": 2, "role": "BB"},
+           {"e": "call", "p": "A", "amt": 1, "allin": False}, {"e": "check", "p": "B", "amt": 0, "allin": False},
+           {"e": "win", "p": "A", "amt": 4}]
+    analyze_hand(fake_hand(ev2, {"A": 2, "B": -2}), stats)
+    assert stats["A"]["vpip"] == 1 and stats["B"]["vpip"] == 0
+
+
+def test_player_style_labels():
+    from SimuPokerBot import player_style
+    base = {"hands": 100}
+    assert player_style({**base, "vpip": 0.18, "pfr": 0.14}) == "TAG (serré-agressif)"
+    assert player_style({**base, "vpip": 0.18, "pfr": 0.04}) == "Rock (serré-passif)"
+    assert player_style({**base, "vpip": 0.35, "pfr": 0.05}) == "Calling station"
+    assert player_style({**base, "vpip": 0.35, "pfr": 0.25}) == "LAG (large-agressif)"
+    assert player_style({**base, "vpip": 0.7, "pfr": 0.5}) == "Maniaque"
+    assert player_style({"hands": 5, "vpip": 0.5, "pfr": 0.5}) == "échantillon trop petit"
+
+
+def test_run_stats_end_to_end(tmp_path):
+    import json
+    from SimuPokerBot import HandHistory, run_session, run_stats
+    path = str(tmp_path / "s.jsonl")
+    run_session(make_bots(["maniac", "station", "random"]), hands=60, seed=2, history=HandHistory(path))
+    out = []
+    assert run_stats(path, output_fn=out.append)
+    text = "\n".join(out)
+    assert "Statistiques sur 60 main(s)" in text and "maniac" in text and "VPIP" in text
+    out.clear()
+    assert run_stats(path, player="maniac", starting_hands=True, output_fn=out.append)
+    assert "Profil de maniac" in out[0] and "Par position" in out[0] and "Mains de départ" in out[0]
+    out.clear()
+    assert run_stats(path, as_json=True, output_fn=out.append)
+    data = json.loads(out[0])
+    assert data["maniac"]["hands"] == 60 and "vpip" in data["maniac"]
+    out.clear()
+    assert not run_stats(path, player="inconnu", output_fn=out.append) and "introuvable" in out[0]
+    out.clear()
+    assert not run_stats(path, label="tournoi", output_fn=out.append)
+    out.clear()
+    assert not run_stats(str(tmp_path / "absent.jsonl"), output_fn=out.append)
+
+
+def test_stats_net_matches_session_results(tmp_path):
+    from SimuPokerBot import HandHistory, compute_stats, load_history
+    path = str(tmp_path / "n.jsonl")
+    res = run_session(make_bots(["maniac", "station"]), hands=40, seed=6, history=HandHistory(path))
+    stats = compute_stats(load_history(path))
+    for name, r in res.items():
+        assert abs(stats[name]["net_bb"] - r["bb"]) < 1e-9
+
+
+def test_cli_stats_mode(tmp_path, capsys):
+    from SimuPokerBot import main
+    path = str(tmp_path / "c.jsonl")
+    main(["--bots", "tight,station", "--hands", "5", "--seed", "2", "--history", path])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        main(["--mode", "stats", "--history", path])
+    assert e.value.code == 0 and "VPIP" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        main(["--mode", "stats", "--history", path, "--player", "zzz"])
+    assert e.value.code == 1
