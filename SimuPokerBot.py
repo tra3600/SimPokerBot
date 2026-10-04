@@ -1338,7 +1338,7 @@ def run_team_tournament(teams, starting_stack=1000, big_blind=20, level_hands=10
     ranking = run_tournament(flat, starting_stack, big_blind, level_hands, seed=seed, verbose=verbose,
                              history=history, label="tournoi-equipe")
     scores = team_scores(ranking, teams_of)
-    winner = max(scores, key=lambda t: (scores[t]["points"], -scores[t]["best_place"]))
+    winner = team_winner(scores)
     return {"ranking": ranking, "teams_of": teams_of, "scores": scores, "winner": winner}
 
 
@@ -1440,7 +1440,7 @@ class RemoteBot(HumanBot):
     def __init__(self, name, conn, timeout=120, on_chat=None):
         super().__init__(name, input_fn=self._ask, output_fn=self.tell)
         self.conn, self.timeout, self.gone = conn, timeout, False
-        self.on_chat, self.last_chat = on_chat, 0.0
+        self.on_chat, self.last_chat, self.team = on_chat, 0.0, None
         self.replies, self.closed = queue.Queue(), False
         threading.Thread(target=self._reader, daemon=True).start()
 
@@ -1519,16 +1519,84 @@ def _handshake(sock, timeout=10):
         return None, None
 
 
+HUMAN_SLOTS = ("humain", "human", "h")
+
+
+def parse_network_teams(spec):
+    """Équipes d'une partie en réseau : ``"Rouge:humain,tight;Bleu:humain,maniac"``.
+
+    Chaque place est ``humain`` (un joueur qui se connecte) ou une stratégie de bot. Renvoie
+    [(nom, [places...])] avec les places humaines normalisées en ``"humain"``."""
+    out = []
+    for name, slots in parse_teams(spec):
+        norm = ["humain" if m.lower() in HUMAN_SLOTS else m for m in slots]
+        for m in norm:
+            if m != "humain" and m not in STRATEGIES:
+                raise ValueError(f"place inconnue {m!r} (humain ou {', '.join(STRATEGIES)})")
+        out.append((name, norm))
+    if not any("humain" in slots for _, slots in out):
+        raise ValueError("il faut au moins une place « humain »")
+    return out
+
+
+def team_winner(scores):
+    """Équipe gagnante : le plus de points, départage par le meilleur joueur individuel."""
+    return max(scores, key=lambda t: (scores[t]["points"], -scores[t]["best_place"]))
+
+
+def format_team_result(scores, teams_of, ranking):
+    lines = ["Résultat par équipe :"]
+    for t in sorted(scores, key=lambda t: (-scores[t]["points"], scores[t]["best_place"])):
+        sc = scores[t]
+        members = ", ".join(f"{n} ({p}e)" for n, p in sorted(sc["places"].items(), key=lambda kv: kv[1]))
+        lines.append(f"  {t:<12}{sc['points']:>3} pts  {members}")
+    lines.append(f"*** Équipe gagnante : {team_winner(scores)} ***")
+    return "\n".join(lines)
+
+
+def assign_team(free, wanted):
+    """Choisit l'équipe d'un joueur qui arrive. ``free`` : {équipe: places humaines libres}.
+    Renvoie (équipe, None) ou (None, message d'erreur)."""
+    open_teams = [t for t, n in free.items() if n > 0]
+    if wanted:
+        match = next((t for t in free if t.lower() == wanted.lower()), None)
+        if match is None:
+            return None, (f"Équipe inconnue : {wanted!r}. Équipes avec des places libres : "
+                          f"{', '.join(open_teams) or 'aucune'}.")
+        if free[match] == 0:
+            return None, (f"L'équipe {match} est complète. Places libres : "
+                          f"{', '.join(open_teams) or 'aucune'}.")
+        return match, None
+    return open_teams[0], None
+
+
 def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), hands=None,
                tournament=False, stack=None, big_blind=None, level_hands=10, seed=None,
-               timeout=120, on_listen=None, output_fn=print, leaderboard=None, history=None):
+               timeout=120, on_listen=None, output_fn=print, leaderboard=None, history=None, teams=None):
     """Héberge une partie : attend ``players`` joueurs humains, les fait jouer entre eux
     (et contre ``opponents``) puis renvoie les résultats (gains cash ou classement tournoi).
+
+    ``teams`` (voir ``parse_network_teams``, tournoi uniquement) : tournoi par équipes ; ``players``
+    et ``opponents`` sont alors déduits des places « humain » et des bots de chaque équipe.
 
     Des spectateurs (``run_client(..., spectate=True)``) peuvent se connecter avant ou
     pendant la partie : ils reçoivent tout ce qui est public (jamais les cartes cachées)."""
     stack = stack or (1000 if tournament else 100)
     big_blind = big_blind or (20 if tournament else 2)
+    free, team_bots, team_of_bot = {}, {}, {}
+    if teams:
+        if not tournament:
+            raise ValueError("les équipes ne fonctionnent qu'en tournoi")
+        players = sum(slots.count("humain") for _, slots in teams)
+        free = {name: slots.count("humain") for name, slots in teams}
+        flat = make_bots([m for _, slots in teams for m in slots if m != "humain"])
+        k = 0
+        for name, slots in teams:
+            team_bots[name] = flat[k:k + len(slots) - slots.count("humain")]
+            k += len(team_bots[name])
+            for b in team_bots[name]:
+                team_of_bot[b.name] = name
+        opponents = flat
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     remotes, spectators, taken = [], [], {b.name for b in opponents}
@@ -1555,6 +1623,13 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
             bot.tell("(chat) trop rapide, patientez un instant.")
             return
         bot.last_chat = now
+        if bot.team and text.startswith("t "):  # « t message » : réservé aux coéquipiers
+            msg = text[2:].strip()
+            if msg:
+                for r in remotes:
+                    if r.team == bot.team:
+                        r.tell(f"[équipe {bot.team}] {bot.name}: {msg}")
+            return
         broadcast(f"[chat] {bot.name}: {text}")
 
     def drop_spectator(conn):
@@ -1619,11 +1694,26 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
             if hello.get("role") == "spectator":
                 add_spectator(conn, hello, addr, late=False)
                 continue
+            team = None
+            if teams:
+                team, err = assign_team(free, str(hello.get("team") or "")[:30])
+                if err:
+                    try:
+                        conn.send(t="msg", text=err)
+                    except OSError:
+                        pass
+                    conn.close()
+                    continue
+                free[team] -= 1
             name = _unique_name(hello.get("name", ""), taken)
             taken.add(name)
             bot = RemoteBot(name, conn, timeout, on_chat)
+            bot.team = team
             remotes.append(bot)
-            output_fn(f"{name} connecté depuis {addr[0]} ({len(remotes)}/{players})")
+            output_fn(f"{name} connecté depuis {addr[0]} ({len(remotes)}/{players})"
+                      + (f" — équipe {team}" if team else ""))
+            if team:
+                bot.tell(f"Vous jouez pour l'équipe {team}. « t message » écrit à vos coéquipiers.")
             bot.tell(f"Bienvenue {name} ! En attente des autres joueurs ({len(remotes)}/{players})... "
                      "Tapez /message pour discuter avec la table.")
             for other in remotes[:-1]:
@@ -1634,6 +1724,12 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
     threading.Thread(target=accept_late, daemon=True).start()
 
     everyone = remotes + list(opponents)
+    if teams:  # sièges entrelacés : les coéquipiers ne sont pas côte à côte
+        lineups = [[r for r in remotes if r.team == name] + team_bots[name] for name, _ in teams]
+        everyone = [m[k] for k in range(len(lineups[0])) for m in lineups if k < len(m)]
+        teams_of = {**team_of_bot, **{r.name: r.team for r in remotes}}
+        broadcast("Équipes : " + " | ".join(f"{name}: {', '.join(b.name for b in lineup)}"
+                                           for (name, _), lineup in zip(teams, lineups)))
     broadcast("La partie commence : " + ", ".join(b.name for b in everyone))
     rng = random.Random(seed)
     if seed is not None:
@@ -1644,6 +1740,8 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
                                      show_hole=False, history=history, label="réseau-tournoi",
                                      should_stop=lambda: all(r.gone for r in remotes))
             broadcast("\nClassement final : " + " > ".join(f"{i}. {n}" for i, n in enumerate(ranking, 1)))
+            if teams:
+                broadcast("\n" + format_team_result(team_scores(ranking, teams_of), teams_of, ranking))
             if leaderboard:
                 leaderboard.record_tournament(
                     {r.name: (ranking.index(r.name) + 1, len(ranking)) for r in remotes})
@@ -1686,14 +1784,16 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
             w.close()
 
 
-def run_client(host, port, name="Joueur", input_fn=input, output_fn=print, spectate=False):
+def run_client(host, port, name="Joueur", input_fn=input, output_fn=print, spectate=False,
+               team=None):
     """Se connecte à un serveur et relaie affichages / saisies jusqu'à la fin de la partie.
 
     Les messages du serveur sont affichés en continu (chat compris). Une ligne commençant par
     ``/`` est envoyée au chat à tout moment ; toute autre ligne répond à la décision en attente.
     En mode ``spectate`` on regarde la partie sans jouer."""
     conn = Conn(socket.create_connection((host, port), timeout=15))
-    conn.send(name=name, role="spectator" if spectate else "player")
+    conn.send(name=name, role="spectator" if spectate else "player",
+              **({"team": team} if team else {}))
     done, lock, state = threading.Event(), threading.Lock(), {"pending": False}
 
     def network():
@@ -1791,8 +1891,11 @@ def main(argv=None):
                    help="mode stats --player : détaille les résultats par main de départ (AKs, 77...)")
     p.add_argument("--min-samples", type=int, default=3, help="mode stats : occurrences minimum par main de départ")
     p.add_argument("--json", action="store_true", help="mode stats : sortie JSON")
-    p.add_argument("--teams", default="tight,loose;maniac,station",
-                   help="mode team : équipes séparées par « ; », ex. \"Rouge:tight,maniac;Bleu:station,loose\"")
+    p.add_argument("--teams", default=None,
+                   help="équipes séparées par « ; », ex. \"Rouge:tight,maniac;Bleu:station,loose\" "
+                        "(mode team ; défaut tight,loose;maniac,station). Mode server avec --tournament : "
+                        "places « humain » ou bots, ex. \"Rouge:humain,tight;Bleu:humain,maniac\"")
+    p.add_argument("--team", default=None, help="mode client : équipe à rejoindre (tournoi par équipes)")
     p.add_argument("--advice", choices=ADVICE_MODES, default="always",
                    help="mode training : always = conseil avant chaque décision, ask = sur demande (?), "
                         "off = seulement le retour après coup")
@@ -1813,7 +1916,7 @@ def main(argv=None):
         raise SystemExit(0 if ok else 1)
     if args.mode == "team":
         try:
-            teams = parse_teams(args.teams)
+            teams = parse_teams(args.teams or "tight,loose;maniac,station")
             for _, members in teams:
                 make_bots(members)  # valide les noms de stratégies
         except ValueError as err:
@@ -1835,10 +1938,26 @@ def main(argv=None):
         return
     hands_given = "--hands" in (argv if argv is not None else sys.argv)
     if args.mode == "client":
-        run_client(args.host or "127.0.0.1", args.port, args.name or "Joueur", spectate=args.spectate)
+        run_client(args.host or "127.0.0.1", args.port, args.name or "Joueur", spectate=args.spectate,
+                   team=args.team)
         return
     raw = args.bots if args.bots is not None else ("" if args.mode == "server" else "tight,equity,loose,station")
     names = [n.strip() for n in raw.split(",") if n.strip()]
+    if args.mode == "server" and args.teams:
+        if not args.tournament:
+            p.error("--teams en mode server requiert --tournament")
+        if names:
+            p.error("avec --teams, les bots se déclarent dans les équipes (pas de --bots)")
+        try:
+            net_teams = parse_network_teams(args.teams)
+        except ValueError as err:
+            p.error(str(err))
+        run_server(args.host or "127.0.0.1", args.port, 0, (), None, True,
+                   args.stack if args.stack != 100 else None,
+                   args.big_blind if args.big_blind != 2 else None,
+                   args.level_hands, args.seed, args.timeout, leaderboard=board, history=history,
+                   teams=net_teams)
+        return
     if args.mode == "server":
         if not 2 <= args.players + len(names) <= 9:
             p.error("il faut entre 2 et 9 joueurs au total (humains + bots)")

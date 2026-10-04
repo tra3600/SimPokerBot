@@ -818,3 +818,102 @@ def test_same_seed_gives_same_games():
     assert a == b
     assert run_session(make_bots(names), hands=15, seed=12) != a
     assert run_tournament(make_bots(names), seed=5) == run_tournament(make_bots(names), seed=5)
+
+
+# --------------------------------------------------------------------------
+# Tournoi par équipes en réseau
+# --------------------------------------------------------------------------
+def test_parse_network_teams():
+    from SimuPokerBot import parse_network_teams
+    assert parse_network_teams("Rouge:humain,tight;Bleu:h,maniac") == [
+        ("Rouge", ["humain", "tight"]), ("Bleu", ["humain", "maniac"])]
+    for bad in ("A:tight;B:station", "A:humain,nope;B:humain,tight", "A:humain;B:humain,tight"):
+        with pytest.raises(ValueError):
+            parse_network_teams(bad)
+
+
+def test_assign_team():
+    from SimuPokerBot import assign_team
+    free = {"Rouge": 1, "Bleu": 0}
+    assert assign_team(free, "rouge") == ("Rouge", None)
+    assert assign_team(free, "") == ("Rouge", None)
+    assert "complète" in assign_team(free, "Bleu")[1]
+    assert "inconnue" in assign_team(free, "Vert")[1]
+
+
+def _team_server(spec, **kw):
+    from SimuPokerBot import parse_network_teams
+    return _start_server(players=0, tournament=True, teams=parse_network_teams(spec), seed=3, **kw)
+
+
+def test_network_team_tournament_scores_and_team_chat():
+    import threading
+    from SimuPokerBot import run_client
+    shove = lambda prompt="": "a" if "a = tapis" in prompt else "c"
+    srv, port = _team_server("Rouge:humain,humain;Bleu:humain,station")
+    logs, threads = {}, []
+    for name, team, first in (("alice", "Rouge", "/t on pousse"), ("bob", "Rouge", None),
+                              ("carl", "Bleu", "/bonjour")):
+        input_fn, out, log = make_client_io(shove, first_chat=first)
+        logs[name] = log
+        th = threading.Thread(target=run_client, daemon=True, kwargs=dict(
+            host="127.0.0.1", port=port, name=name, input_fn=input_fn, output_fn=out, team=team))
+        th.start()
+        threads.append(th)
+    srv.join(60)
+    assert not srv.is_alive()
+    for th in threads:
+        th.join(5)
+    for log in logs.values():
+        text = "\n".join(log)
+        assert "Équipes :" in text and "Résultat par équipe" in text and "Équipe gagnante" in text
+    # le message d'équipe n'arrive qu'aux coéquipiers ; le chat normal à tous
+    assert any(l == "[équipe Rouge] alice: on pousse" for l in logs["bob"])
+    assert not any("on pousse" in l for l in logs["carl"])
+    assert any(l == "[chat] carl: bonjour" for l in logs["alice"])
+
+
+def test_network_team_full_or_unknown_team_rejected():
+    import socket as sk
+    import time
+    from SimuPokerBot import Conn
+    srv, port = _team_server("Rouge:humain,station;Bleu:humain,station")
+    c1 = Conn(sk.create_connection(("127.0.0.1", port), timeout=5))
+    c1.send(name="alice", role="player", team="Rouge")
+    assert "Vous jouez pour l'équipe Rouge" in _drain(c1)
+    c2 = Conn(sk.create_connection(("127.0.0.1", port), timeout=5))
+    c2.send(name="bob", role="player", team="Rouge")
+    assert "complète" in c2.recv(5)["text"]
+    c3 = Conn(sk.create_connection(("127.0.0.1", port), timeout=5))
+    c3.send(name="carl", role="player", team="Vert")
+    assert "inconnue" in c3.recv(5)["text"]
+    # carl rejoint enfin Bleu : la partie démarre ; on la termine en quittant
+    c4 = Conn(sk.create_connection(("127.0.0.1", port), timeout=5))
+    c4.send(name="dave", role="player", team="Bleu")
+    for c in (c1, c4):
+        c.send(r="q")
+        c.send(r="q")
+    time.sleep(0.5)
+    for c in (c1, c2, c3, c4):
+        c.close()
+    srv.join(30)
+    assert not srv.is_alive()
+
+
+def _drain(conn, until="Vous jouez pour l'équipe", limit=5):
+    text = ""
+    for _ in range(limit):
+        text += conn.recv(5).get("text", "") + "\n"
+        if until in text:
+            break
+    return text
+
+
+def test_server_cli_teams_validation(capsys):
+    from SimuPokerBot import main
+    with pytest.raises(SystemExit) as e:
+        main(["--mode", "server", "--teams", "A:humain,tight;B:humain,maniac"])
+    assert e.value.code == 2 and "--tournament" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:
+        main(["--mode", "server", "--tournament", "--teams", "A:tight;B:station"])
+    assert e.value.code == 2

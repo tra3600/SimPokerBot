@@ -121,3 +121,18 @@ Les bots d'une même équipe jouent un tournoi classique (élimination individue
 - toutes les équipes doivent avoir la même taille (2 à 9 joueurs au total) ; le nom d'équipe est facultatif (`--teams "tight,loose;maniac,station"`) ; deux bots de même stratégie sont renommés (`maniac1`, `maniac2`).
 
 Le rapport sur `--tournaments N` donne par équipe : victoires, points moyens, meilleure place moyenne, puis le classement individuel du dernier tournoi. `--stack`, `--big-blind`, `--level-hands`, `--verbose` et `--history` (libellé `tournoi-equipe`) fonctionnent comme en mode tournoi. Les coéquipiers jouent chacun pour eux : il n'y a ni partage de jetons ni coordination, et le mode est réservé aux bots (pas d'équipes de joueurs humains en réseau).
+
+### Tournoi par équipes en réseau
+Des joueurs humains (et éventuellement des bots) forment des équipes sur le serveur :
+
+    # Hôte : 2 équipes de 2, chacune avec un humain et un bot
+    python SimuPokerBot.py --mode server --host 0.0.0.0 --tournament --teams "Rouge:humain,tight;Bleu:humain,maniac"
+
+    # Joueurs : chacun choisit son équipe
+    python SimuPokerBot.py --mode client --host <ip_de_l_hote> --name Alice --team Rouge
+
+- `--teams` (serveur, avec `--tournament`) liste les places de chaque équipe : `humain` (un joueur qui se connecte) ou une stratégie de bot. Toutes les équipes ont la même taille ; le nombre de joueurs attendus se déduit des places `humain`.
+- Un client qui n'indique pas `--team` est placé dans la première équipe qui a une place libre ; une équipe inconnue ou complète est refusée avec la liste des places restantes. Les sièges sont entrelacés entre équipes.
+- Même règles de score que le tournoi par équipes entre bots (points = joueurs battus, somme par équipe, départage au meilleur joueur individuel) ; le résultat par équipe est diffusé à la fin, et le classement persistant enregistre les places individuelles des humains.
+- Chat : `/message` va à toute la table ; `/t message` (la lettre t suivie d'un espace) n'est envoyé qu'à vos coéquipiers. Les spectateurs ne voient pas les messages d'équipe.
+- Comme à une vraie table par équipes, rien n'empêche les coéquipiers de se parler de leurs cartes via le chat d'équipe : à régler entre joueurs.
