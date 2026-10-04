@@ -242,6 +242,19 @@ def make_bots(names):
 # --------------------------------------------------------------------------
 # Moteur de jeu
 # --------------------------------------------------------------------------
+def new_deck(rng=random):
+    """Paquet mélangé avec ``rng`` : les parties sont reproductibles avec une graine.
+
+    Les versions récentes de treys ont leur propre générateur (``Deck(seed=...)``) ; les anciennes
+    utilisent le module ``random`` global, que l'on réinitialise alors."""
+    seed = rng.getrandbits(64)
+    try:
+        return Deck(seed=seed)
+    except TypeError:
+        random.seed(seed)
+        return Deck()
+
+
 def deal_hands(num_players, deck=None):
     deck = deck or Deck()
     return [deck.draw(2) for _ in range(num_players)], deck
@@ -313,7 +326,7 @@ class Hand:
 
     # -- déroulement -------------------------------------------------------
     def play(self):
-        deck = Deck()
+        deck = new_deck(self.rng)
         self.hands, _ = deal_hands(self.n, deck)
         if self.show_hole:
             for i, h in enumerate(self.hands):
@@ -459,7 +472,7 @@ class Hand:
 def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=False, history=None):
     rng = random.Random(seed)
     if seed is not None:
-        random.seed(seed)  # treys.Deck utilise le module random global
+        random.seed(seed)
     net = defaultdict(float)
     wins = defaultdict(int)
     log = print if verbose else None
@@ -1270,6 +1283,94 @@ def print_tournament_report(results, count):
         print(f"{name:<10}{r['wins']:>11}{r['avg_place']:>12.2f}")
 
 
+# --------------------------------------------------------------------------
+# Tournoi par équipes (bots)
+# --------------------------------------------------------------------------
+def parse_teams(spec):
+    """``"Rouge:tight,maniac;Bleu:station,loose"`` -> [("Rouge", ["tight", "maniac"]), ...].
+
+    Le nom d'équipe est facultatif (« Équipe 1 », « Équipe 2 »...). Toutes les équipes doivent
+    avoir la même taille, avec 2 à 9 joueurs au total."""
+    teams = []
+    for k, chunk in enumerate(c for c in spec.split(";") if c.strip()):
+        name, sep, members = chunk.partition(":")
+        if not sep:
+            name, members = f"Équipe {k + 1}", chunk
+        names = [m.strip() for m in members.split(",") if m.strip()]
+        if not names:
+            raise ValueError(f"équipe {name.strip()!r} vide")
+        teams.append((name.strip(), names))
+    if len(teams) < 2:
+        raise ValueError("il faut au moins 2 équipes (séparées par « ; »)")
+    if len({n for n, _ in teams}) != len(teams):
+        raise ValueError("deux équipes portent le même nom")
+    if len({len(m) for _, m in teams}) != 1:
+        raise ValueError("toutes les équipes doivent avoir le même nombre de joueurs")
+    total = sum(len(m) for _, m in teams)
+    if not 2 <= total <= 9:
+        raise ValueError(f"{total} joueurs au total : il en faut entre 2 et 9")
+    return teams
+
+
+def team_scores(ranking, teams_of):
+    """Points individuels = joueurs battus (le vainqueur marque N-1, le dernier 0) ; score d'équipe =
+    somme des points des membres. ``teams_of`` : {nom de bot: équipe}. Renvoie {équipe: dict}."""
+    n = len(ranking)
+    out = {}
+    for place, name in enumerate(ranking, 1):
+        t = out.setdefault(teams_of[name], {"points": 0, "best_place": n, "places": {}})
+        t["points"] += n - place
+        t["best_place"] = min(t["best_place"], place)
+        t["places"][name] = place
+    return out
+
+
+def run_team_tournament(teams, starting_stack=1000, big_blind=20, level_hands=10, seed=None,
+                        verbose=False, history=None):
+    """Un tournoi où chaque bot joue pour son équipe. Renvoie le classement individuel et les
+    scores d'équipe ; l'équipe gagnante a le plus de points (départage : meilleur joueur)."""
+    flat = make_bots([m for _, members in teams for m in members])
+    teams_of, k = {}, 0
+    for team_name, members in teams:
+        for _ in members:
+            teams_of[flat[k].name] = team_name
+            k += 1
+    ranking = run_tournament(flat, starting_stack, big_blind, level_hands, seed=seed, verbose=verbose,
+                             history=history, label="tournoi-equipe")
+    scores = team_scores(ranking, teams_of)
+    winner = max(scores, key=lambda t: (scores[t]["points"], -scores[t]["best_place"]))
+    return {"ranking": ranking, "teams_of": teams_of, "scores": scores, "winner": winner}
+
+
+def run_team_tournaments(teams, count=1, seed=None, **kwargs):
+    """Répète ``count`` tournois et cumule victoires, points moyens et places des équipes."""
+    agg = {name: {"wins": 0, "points": 0, "best_place": 0, "members": members}
+           for name, members in teams}
+    last = None
+    for t in range(count):
+        last = run_team_tournament(teams, seed=None if seed is None else seed + t, **kwargs)
+        agg[last["winner"]]["wins"] += 1
+        for team, sc in last["scores"].items():
+            agg[team]["points"] += sc["points"]
+            agg[team]["best_place"] += sc["best_place"]
+    for a in agg.values():
+        a["avg_points"], a["avg_best_place"] = a["points"] / count, a["best_place"] / count
+    return {"teams": agg, "last": last, "count": count}
+
+
+def print_team_report(result):
+    agg, count, last = result["teams"], result["count"], result["last"]
+    print(f"\nRésultats par équipe sur {count} tournoi(s)")
+    print(f"{'Équipe':<14}{'Victoires':>10}{'Points moy.':>13}{'Meilleure place moy.':>22}  Joueurs")
+    for name, a in sorted(agg.items(), key=lambda kv: (-kv[1]["wins"], -kv[1]["avg_points"])):
+        print(f"{name:<14}{a['wins']:>10}{a['avg_points']:>13.2f}{a['avg_best_place']:>22.2f}  "
+              f"{', '.join(a['members'])}")
+    print(f"\nDernier tournoi : vainqueur {last['ranking'][0]} "
+          f"({last['teams_of'][last['ranking'][0]]}) ; équipe gagnante : {last['winner']}")
+    print("Classement individuel : " + " > ".join(f"{i}. {n} [{last['teams_of'][n]}]"
+                                                  for i, n in enumerate(last["ranking"], 1)))
+
+
 def print_report(results, hands):
     print(f"\nRésultats sur {hands} mains")
     print(f"{'Bot':<10}{'Gain (jetons)':>15}{'Gain (bb)':>12}{'bb/100':>10}{'Mains gagnées':>16}")
@@ -1661,7 +1762,7 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay", "training", "stats"), default="cash",
+    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay", "training", "stats", "team"), default="cash",
                    help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
                         "human : vous jouez contre les bots ; server / client : partie en réseau")
     p.add_argument("--host", default=None,
@@ -1690,6 +1791,8 @@ def main(argv=None):
                    help="mode stats --player : détaille les résultats par main de départ (AKs, 77...)")
     p.add_argument("--min-samples", type=int, default=3, help="mode stats : occurrences minimum par main de départ")
     p.add_argument("--json", action="store_true", help="mode stats : sortie JSON")
+    p.add_argument("--teams", default="tight,loose;maniac,station",
+                   help="mode team : équipes séparées par « ; », ex. \"Rouge:tight,maniac;Bleu:station,loose\"")
     p.add_argument("--advice", choices=ADVICE_MODES, default="always",
                    help="mode training : always = conseil avant chaque décision, ask = sur demande (?), "
                         "off = seulement le retour après coup")
@@ -1708,6 +1811,19 @@ def main(argv=None):
         ok = run_replay(args.history or DEFAULT_HISTORY, args.hand, args.list, args.player,
                         args.step, args.delay)
         raise SystemExit(0 if ok else 1)
+    if args.mode == "team":
+        try:
+            teams = parse_teams(args.teams)
+            for _, members in teams:
+                make_bots(members)  # valide les noms de stratégies
+        except ValueError as err:
+            p.error(str(err))
+        result = run_team_tournaments(
+            teams, args.tournaments, seed=args.seed, starting_stack=args.stack if args.stack != 100 else 1000,
+            big_blind=args.big_blind if args.big_blind != 2 else 20, level_hands=args.level_hands,
+            verbose=args.verbose, history=HandHistory(args.history) if args.history else None)
+        print_team_report(result)
+        return
     if args.mode == "stats":
         ok = run_stats(args.history or DEFAULT_HISTORY, args.player, args.label, args.starting_hands,
                        args.json, args.min_samples)

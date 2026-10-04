@@ -752,3 +752,69 @@ def test_cli_stats_mode(tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         main(["--mode", "stats", "--history", path, "--player", "zzz"])
     assert e.value.code == 1
+
+
+# --------------------------------------------------------------------------
+# Tournoi par équipes
+# --------------------------------------------------------------------------
+def test_parse_teams():
+    from SimuPokerBot import parse_teams
+    assert parse_teams("Rouge:tight,maniac;Bleu:station,loose") == [
+        ("Rouge", ["tight", "maniac"]), ("Bleu", ["station", "loose"])]
+    assert parse_teams("tight,loose; maniac ,station;")[0][0] == "Équipe 1"
+    for bad in ("tight,loose", "A:tight;B:station,loose", "A:tight;A:loose", "A:;B:tight",
+                "A:tight,tight,tight,tight,tight;B:tight,tight,tight,tight,tight"):
+        with pytest.raises(ValueError):
+            parse_teams(bad)
+
+
+def test_team_scores_points_and_tiebreak():
+    from SimuPokerBot import team_scores
+    ranking = ["a1", "b1", "b2", "a2"]
+    sc = team_scores(ranking, {"a1": "A", "a2": "A", "b1": "B", "b2": "B"})
+    assert sc["A"]["points"] == 3 + 0 and sc["B"]["points"] == 2 + 1
+    assert sc["A"]["best_place"] == 1 and sc["B"]["best_place"] == 2
+    assert sc["B"]["places"] == {"b1": 2, "b2": 3}
+
+
+def test_team_tournament_consistent_and_deterministic():
+    from SimuPokerBot import parse_teams, run_team_tournament
+    teams = parse_teams("Rouge:maniac,station;Bleu:random,maniac")
+    r = run_team_tournament(teams, seed=4)
+    assert sorted(r["ranking"]) == ["maniac1", "maniac2", "random", "station"]  # doublons renommés
+    assert sum(t["points"] for t in r["scores"].values()) == 6  # 0+1+2+3
+    assert r["winner"] in ("Rouge", "Bleu")
+    assert r["teams_of"]["maniac1"] == "Rouge" and r["teams_of"]["maniac2"] == "Bleu"
+    assert run_team_tournament(teams, seed=4)["ranking"] == r["ranking"]
+
+
+def test_team_tournaments_aggregate_and_history(tmp_path):
+    from SimuPokerBot import HandHistory, load_history, parse_teams, run_team_tournaments
+    path = str(tmp_path / "t.jsonl")
+    res = run_team_tournaments(parse_teams("A:maniac;B:station"), count=3, seed=1,
+                               history=HandHistory(path))
+    assert sum(a["wins"] for a in res["teams"].values()) == 3
+    assert abs(sum(a["avg_points"] for a in res["teams"].values()) - 1) < 1e-9  # 1 point en jeu
+    assert {r["label"] for r in load_history(path)} == {"tournoi-equipe"}
+
+
+def test_cli_team_mode(capsys):
+    from SimuPokerBot import main
+    main(["--mode", "team", "--teams", "A:maniac;B:station", "--tournaments", "2", "--seed", "3"])
+    out = capsys.readouterr().out
+    assert "Résultats par équipe sur 2 tournoi(s)" in out and "Classement individuel" in out
+    with pytest.raises(SystemExit) as e:
+        main(["--mode", "team", "--teams", "A:maniac"])
+    assert e.value.code == 2
+    with pytest.raises(SystemExit):
+        main(["--mode", "team", "--teams", "A:nope;B:station"])
+
+
+def test_same_seed_gives_same_games():
+    from SimuPokerBot import run_tournament
+    names = ["maniac", "station", "random", "equity"]
+    a = run_session(make_bots(names), hands=15, seed=11)
+    b = run_session(make_bots(names), hands=15, seed=11)
+    assert a == b
+    assert run_session(make_bots(names), hands=15, seed=12) != a
+    assert run_tournament(make_bots(names), seed=5) == run_tournament(make_bots(names), seed=5)

@@ -111,3 +111,13 @@ Le tableau comparatif donne, par joueur : mains, **VPIP** (mains jouées volonta
 Avec `--player NOM` : profil détaillé avec les numérateurs/dénominateurs, les résultats **par position** (BTN, SB, BB, CO, EP/MP) et, avec `--starting-hands`, par **main de départ** (AKs, 77, T9o… au moins `--min-samples` fois). `--label` restreint à un type de partie (`cash`, `tournoi`, `humain`, `réseau`…), `--json` sort les compteurs et ratios pour un traitement externe. Code de sortie 1 si l'analyse est impossible (fichier absent, joueur inconnu).
 
 Les stats portent sur les mains enregistrées seulement, et les échantillons de quelques centaines de mains restent très bruités.
+
+## Tournoi par équipes
+    python SimuPokerBot.py --mode team --teams "Rouge:tight,maniac;Bleu:station,loose" --tournaments 20 --seed 1
+
+Les bots d'une même équipe jouent un tournoi classique (élimination individuelle, blinds croissantes) mais marquent pour leur équipe :
+- chaque joueur marque autant de points que de joueurs battus (le vainqueur *N-1*, le dernier 0) ; le score d'équipe est la somme des points de ses membres ;
+- l'équipe gagnante est celle qui a le plus de points ; en cas d'égalité, celle qui compte le meilleur joueur individuel ;
+- toutes les équipes doivent avoir la même taille (2 à 9 joueurs au total) ; le nom d'équipe est facultatif (`--teams "tight,loose;maniac,station"`) ; deux bots de même stratégie sont renommés (`maniac1`, `maniac2`).
+
+Le rapport sur `--tournaments N` donne par équipe : victoires, points moyens, meilleure place moyenne, puis le classement individuel du dernier tournoi. `--stack`, `--big-blind`, `--level-hands`, `--verbose` et `--history` (libellé `tournoi-equipe`) fonctionnent comme en mode tournoi. Les coéquipiers jouent chacun pour eux : il n'y a ni partage de jetons ni coordination, et le mode est réservé aux bots (pas d'équipes de joueurs humains en réseau).
