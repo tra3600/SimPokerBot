@@ -1,35 +1,24 @@
 # SimPokerBot
-Simulation d'un bot de Poker
+Simulateur hors ligne de Texas Hold'em No-Limit où s'affrontent des bots. Il ne se connecte à aucun site de poker : c'est un outil d'étude de stratégies.
 
-Il est important de noter que jouer au poker en ligne avec un bot peut être illégal et contre les termes de service de la plupart des sites de poker en ligne. En outre, le développement et l'utilisation de tels bots peuvent entraîner des conséquences juridiques et la suspension de comptes sur ces plateformes. Par conséquent, je ne peux pas aider à écrire un bot de poker qui se connecte à des sites de poker en ligne et joue automatiquement.
+## Installation
+    pip install -r requirements.txt
 
-Cependant, je peux vous montrer comment écrire un programme simple pour simuler un jeu de poker ou analyser des stratégies de poker en Python. Cela peut être un excellent moyen d'apprendre les bases du jeu et d'analyser différentes stratégies de manière légale et éthique.
+## Utilisation
+    python SimuPokerBot.py --hands 2000 --seed 1
+    python SimuPokerBot.py --bots tight,maniac,station,random --hands 500
+    python SimuPokerBot.py --bots tight,maniac --hands 3 --verbose   # détail de chaque main
 
-Exemple de Simulation de Poker en Python
-Voici un exemple de programme Python qui simule un jeu simple de Texas Hold'em Poker entre plusieurs joueurs. Vous pouvez utiliser cet exemple pour étudier les différentes stratégies de poker.
+Options : `--bots`, `--hands`, `--stack` (tapis à chaque main), `--big-blind`, `--seed`, `--verbose`.
 
-Prérequis
-Installer la bibliothèque treys qui permet de manipuler des cartes et d'évaluer des mains de poker:
+## Fonctionnalités
+- Mains complètes : blinds, préflop/flop/turn/river, relances (max 4 par tour), tapis et side pots.
+- Équité Monte-Carlo (`estimate_equity`) contre des mains aléatoires.
+- Stratégies : `tight`, `equity`, `loose` (basées sur l'équité et les cotes du pot), `maniac`, `station`, `random`.
+- Rapport final : gain en jetons et en grosses blinds, bb/100, mains gagnées.
 
-pip install treys
+## Ajouter un bot
+Créer une sous-classe de `Bot` avec `act(view)` renvoyant `("fold"|"call"|"raise", montant_total)`, puis l'ajouter à `STRATEGIES`.
 
-Explications
-Importation des Bibliothèques :
-
-treys est une bibliothèque Python pour manipuler des cartes et évaluer des mains de poker.
-Fonction deal_hands :
-
-Crée un deck de cartes et distribue deux cartes à chaque joueur.
-Fonction simulate_game :
-
-Distribue les mains aux joueurs et tire les cinq cartes du board.
-Utilise Evaluator pour évaluer les mains des joueurs.
-Affiche les cartes du board et les mains des joueurs.
-Détermine le(s) gagnant(s) en fonction des scores des mains.
-Bloc Principal :
-
-Définit le nombre de joueurs et appelle simulate_game pour simuler une partie.
-Utilisation
-Exécutez le script Python.
-Le programme simulera une partie de Texas Hold'em entre le nombre de joueurs spécifié.
-Ce programme est une simulation simple et ne se connecte à aucun site de poker en ligne. Vous pouvez l'utiliser pour étudier les différentes stratégies et améliorer vos compétences de manière légale et éthique.
+## Tests
+    pytest
