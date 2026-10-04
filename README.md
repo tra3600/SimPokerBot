@@ -57,3 +57,8 @@ Jeu à plusieurs humains (jetons fictifs) via TCP, un joueur héberge, les autre
 - `--timeout` (120 s par défaut) : sans réponse, le joueur se couche / check. Un joueur déconnecté se couche automatiquement.
 - Total humains + bots : 2 à 9. `--host` vaut `127.0.0.1` par défaut (local uniquement) ; `0.0.0.0` ouvre la partie au réseau local.
 - Sécurité : le protocole est en clair et sans authentification (pseudo libre) — à réserver à un réseau de confiance, ne pas exposer sur Internet.
+
+### Spectateurs
+    python SimuPokerBot.py --mode client --host <ip_de_l_hote> --port 5555 --name Public --spectate
+
+Un spectateur peut se connecter avant ou pendant la partie (20 au maximum). Il reçoit tout ce qui est public : actions, board, pots, résultats, totaux ou classement. Les cartes cachées (y compris celles des bots) ne sont montrées qu'au showdown, comme pour les joueurs. Les joueurs sont prévenus quand quelqu'un rejoint comme spectateur. Un spectateur qui se déconnecte ou ne lit plus ses messages est retiré sans ralentir la partie. Une fois la partie commencée, les nouveaux joueurs sont refusés (ils peuvent rejoindre en spectateurs).

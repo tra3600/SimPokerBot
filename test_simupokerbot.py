@@ -205,3 +205,72 @@ def test_conn_rejects_garbage():
     b.sendall(b"pas du json\n")
     with pytest.raises(ConnectionError):
         Conn(a).recv(1)
+
+
+def test_spectators_see_public_info_only_lobby_and_late():
+    import threading
+    import time
+    from SimuPokerBot import make_bots, run_client, run_server
+    ready, port, result = threading.Event(), [], {}
+
+    def on_listen(p):
+        port.append(p)
+        ready.set()
+
+    srv = threading.Thread(target=lambda: result.setdefault("r", run_server(
+        port=0, players=1, opponents=make_bots(["station"]), on_listen=on_listen,
+        output_fn=lambda *_: None, timeout=10, seed=4)), daemon=True)
+    srv.start()
+    assert ready.wait(5)
+    early, late, player_out = [], [], []
+    spec = lambda name, out: threading.Thread(
+        target=run_client, daemon=True, kwargs=dict(host="127.0.0.1", port=port[0], name=name,
+                                                    output_fn=out.append, spectate=True))
+    s1 = spec("early", early)
+    s1.start()
+    time.sleep(0.3)  # le spectateur est accepté pendant le lobby
+    count = [0]
+
+    def slow_player(prompt=""):
+        count[0] += 1
+        time.sleep(0.05)
+        return "q" if count[0] > 25 else "c"
+
+    p = threading.Thread(target=run_client, daemon=True, args=("127.0.0.1", port[0], "alice", slow_player,
+                                                               player_out.append))
+    p.start()
+    time.sleep(0.4)
+    s2 = spec("late", late)  # rejoint en cours de partie
+    s2.start()
+    srv.join(60)
+    for t in (p, s1, s2):
+        t.join(5)
+    assert not srv.is_alive()
+    for out in (early, late):
+        text = "\n".join(out)
+        assert "Main" in text and "Le serveur ferme" in text
+        assert "Vos cartes" not in text and "Commande" not in text
+    assert any("regarde la partie" in l for l in player_out)
+    assert any("Vous regardez la partie" in l and "déjà en cours" in l for l in late)
+
+
+def test_late_player_is_rejected():
+    import socket as sk
+    import threading
+    from SimuPokerBot import Conn, make_bots, run_client, run_server
+    ready, port = threading.Event(), []
+    srv = threading.Thread(target=lambda: run_server(
+        port=0, players=1, opponents=make_bots(["station"]), hands=1000,
+        on_listen=lambda p: (port.append(p), ready.set()), output_fn=lambda *_: None, timeout=3),
+        daemon=True)
+    srv.start()
+    assert ready.wait(5)
+    p = threading.Thread(target=run_client, daemon=True,
+                         args=("127.0.0.1", port[0], "a", lambda prompt="": "c", lambda *_: None))
+    p.start()
+    import time
+    time.sleep(0.5)
+    c = Conn(sk.create_connection(("127.0.0.1", port[0]), timeout=5))
+    c.send(name="intrus", role="player")
+    assert "déjà commencée" in c.recv(5)["text"]
+    c.close()

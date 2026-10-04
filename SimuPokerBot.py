@@ -18,6 +18,7 @@ import json
 import random
 import socket
 import sys
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -570,6 +571,7 @@ def print_report(results, hands):
 # Multijoueur en réseau (TCP, jetons fictifs, protocole JSON ligne par ligne)
 # --------------------------------------------------------------------------
 DEFAULT_PORT = 5555
+MAX_SPECTATORS = 20
 MAX_LINE = 4096  # taille maximale d'un message reçu d'un client
 
 
@@ -578,9 +580,13 @@ class Conn:
 
     def __init__(self, sock):
         self.sock, self.buf = sock, b""
+        self._send_lock = threading.Lock()  # le moteur et un thread d'accueil peuvent écrire
 
     def send(self, **msg):
-        self.sock.sendall(json.dumps(msg, ensure_ascii=False).encode() + b"\n")
+        data = json.dumps(msg, ensure_ascii=False).encode() + b"\n"
+        with self._send_lock:
+            self.sock.settimeout(10)  # un client qui ne lit plus ne doit pas bloquer la partie
+            self.sock.sendall(data)
 
     def recv(self, timeout=None):
         """Renvoie le prochain message (dict). Lève TimeoutError ou ConnectionError."""
@@ -653,30 +659,104 @@ def _unique_name(name, taken):
     return name
 
 
+def _handshake(sock, timeout=10):
+    """Lit le message d'accueil d'un client. Renvoie (conn, hello) ou (None, None) si invalide."""
+    conn = Conn(sock)
+    try:
+        return conn, conn.recv(timeout)
+    except (OSError, ConnectionError):
+        conn.close()
+        return None, None
+
+
 def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), hands=None,
                tournament=False, stack=None, big_blind=None, level_hands=10, seed=None,
                timeout=120, on_listen=None, output_fn=print):
     """Héberge une partie : attend ``players`` joueurs humains, les fait jouer entre eux
-    (et contre ``opponents``) puis renvoie les résultats (gains cash ou classement tournoi)."""
+    (et contre ``opponents``) puis renvoie les résultats (gains cash ou classement tournoi).
+
+    Des spectateurs (``run_client(..., spectate=True)``) peuvent se connecter avant ou
+    pendant la partie : ils reçoivent tout ce qui est public (jamais les cartes cachées)."""
     stack = stack or (1000 if tournament else 100)
     big_blind = big_blind or (20 if tournament else 2)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(players)
-    output_fn(f"Serveur en écoute sur {host}:{server.getsockname()[1]} "
-              f"({players} joueur(s) attendu(s))")
-    if on_listen:
-        on_listen(server.getsockname()[1])
-    remotes, taken = [], {b.name for b in opponents}
+    remotes, spectators, taken = [], [], {b.name for b in opponents}
+    lock = threading.Lock()
+
+    def broadcast(text):
+        output_fn(text)
+        for r in remotes:
+            r.tell(text)
+        with lock:
+            watchers = list(spectators)
+        for w in watchers:
+            try:
+                w.send(t="msg", text=str(text))
+            except OSError:
+                drop_spectator(w)
+
+    def drop_spectator(conn):
+        with lock:
+            if conn in spectators:
+                spectators.remove(conn)
+        conn.close()
+
+    def add_spectator(conn, hello, addr, late):
+        with lock:
+            name = _unique_name(hello.get("name", ""), taken)
+            taken.add(name)
+            full = len(spectators) >= MAX_SPECTATORS
+        try:
+            if full:
+                conn.send(t="msg", text="Trop de spectateurs sur ce serveur.")
+                conn.close()
+                return
+            conn.send(t="msg", text=f"Vous regardez la partie en tant que {name}."
+                      + (" Elle est déjà en cours." if late else " Elle va commencer."))
+        except OSError:
+            conn.close()
+            return
+        with lock:
+            spectators.append(conn)
+        broadcast(f"[{name} regarde la partie]")
+
+    def late_client(sock, addr):
+        conn, hello = _handshake(sock)
+        if conn is None:
+            return
+        if hello.get("role") == "spectator":
+            add_spectator(conn, hello, addr, late=True)
+        else:
+            try:
+                conn.send(t="msg", text="La partie est déjà commencée : vous pouvez la suivre "
+                                        "avec --spectate.")
+            except OSError:
+                pass
+            conn.close()
+
+    def accept_late():
+        while True:
+            try:
+                sock, addr = server.accept()
+            except OSError:  # socket fermée en fin de partie
+                return
+            threading.Thread(target=late_client, args=(sock, addr), daemon=True).start()
+
     try:
+        server.bind((host, port))
+        server.listen(players + MAX_SPECTATORS)
+        output_fn(f"Serveur en écoute sur {host}:{server.getsockname()[1]} "
+                  f"({players} joueur(s) attendu(s))")
+        if on_listen:
+            on_listen(server.getsockname()[1])
         while len(remotes) < players:
             sock, addr = server.accept()
-            conn = Conn(sock)
-            try:
-                hello = conn.recv(30)
-            except (OSError, ConnectionError):
-                conn.close()
+            conn, hello = _handshake(sock)
+            if conn is None:
+                continue
+            if hello.get("role") == "spectator":
+                add_spectator(conn, hello, addr, late=False)
                 continue
             name = _unique_name(hello.get("name", ""), taken)
             taken.add(name)
@@ -686,13 +766,10 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
             bot.tell(f"Bienvenue {name} ! En attente des autres joueurs ({len(remotes)}/{players})...")
             for other in remotes[:-1]:
                 other.tell(f"{name} a rejoint la table ({len(remotes)}/{players}).")
-    finally:
+    except BaseException:
         server.close()
-
-    def broadcast(text):
-        output_fn(text)
-        for r in remotes:
-            r.tell(text)
+        raise
+    threading.Thread(target=accept_late, daemon=True).start()
 
     everyone = remotes + list(opponents)
     broadcast("La partie commence : " + ", ".join(b.name for b in everyone))
@@ -721,22 +798,32 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
         broadcast(f"\nFin de la partie après {played} main(s).")
         return dict(totals)
     finally:
+        server.close()
         for r in remotes:
             if not r.gone:
                 r.tell("Le serveur ferme la partie. Merci d'avoir joué !")
                 r.disconnect()
+        with lock:
+            watchers, spectators[:] = list(spectators), []
+        for w in watchers:
+            try:
+                w.send(t="msg", text="Le serveur ferme la partie. Merci d'avoir regardé !")
+            except OSError:
+                pass
+            w.close()
 
 
-def run_client(host, port, name="Joueur", input_fn=input, output_fn=print):
-    """Se connecte à un serveur et relaie affichages / saisies jusqu'à la fin de la partie."""
+def run_client(host, port, name="Joueur", input_fn=input, output_fn=print, spectate=False):
+    """Se connecte à un serveur et relaie affichages / saisies jusqu'à la fin de la partie.
+    En mode ``spectate`` on regarde la partie sans jouer."""
     conn = Conn(socket.create_connection((host, port), timeout=15))
-    conn.send(name=name)
+    conn.send(name=name, role="spectator" if spectate else "player")
     try:
         while True:
             msg = conn.recv(None)
             if msg.get("t") == "msg":
                 output_fn(msg.get("text", ""))
-            elif msg.get("t") == "ask":
+            elif msg.get("t") == "ask" and not spectate:
                 try:
                     answer = input_fn(msg.get("text", ""))
                 except (EOFError, KeyboardInterrupt):
@@ -765,6 +852,8 @@ def main(argv=None):
                         "(défaut 127.0.0.1, utilisez 0.0.0.0 pour le réseau local)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--name", default="Joueur", help="votre pseudo (mode client)")
+    p.add_argument("--spectate", action="store_true",
+                   help="mode client : regarder la partie sans jouer (avant ou pendant)")
     p.add_argument("--players", type=int, default=2, help="joueurs humains attendus (mode server)")
     p.add_argument("--timeout", type=int, default=120, help="secondes par décision (mode server)")
     p.add_argument("--tournaments", type=int, default=1, help="nombre de tournois (mode tournament)")
@@ -776,7 +865,7 @@ def main(argv=None):
 
     hands_given = "--hands" in (argv if argv is not None else sys.argv)
     if args.mode == "client":
-        run_client(args.host or "127.0.0.1", args.port, args.name)
+        run_client(args.host or "127.0.0.1", args.port, args.name, spectate=args.spectate)
         return
     raw = args.bots if args.bots is not None else ("" if args.mode == "server" else "tight,equity,loose,station")
     names = [n.strip() for n in raw.split(",") if n.strip()]
