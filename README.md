@@ -62,3 +62,6 @@ Jeu à plusieurs humains (jetons fictifs) via TCP, un joueur héberge, les autre
     python SimuPokerBot.py --mode client --host <ip_de_l_hote> --port 5555 --name Public --spectate
 
 Un spectateur peut se connecter avant ou pendant la partie (20 au maximum). Il reçoit tout ce qui est public : actions, board, pots, résultats, totaux ou classement. Les cartes cachées (y compris celles des bots) ne sont montrées qu'au showdown, comme pour les joueurs. Les joueurs sont prévenus quand quelqu'un rejoint comme spectateur. Un spectateur qui se déconnecte ou ne lit plus ses messages est retiré sans ralentir la partie. Une fois la partie commencée, les nouveaux joueurs sont refusés (ils peuvent rejoindre en spectateurs).
+
+### Chat
+Les joueurs (et eux seuls) peuvent discuter à tout moment, même hors de leur tour : une ligne qui commence par `/` est envoyée au chat, par exemple `/bien joué !`. Toute autre ligne répond à la décision en cours. Le chat est diffusé à tous les joueurs, aux spectateurs et dans la console du serveur sous la forme `[chat] Alice: bien joué !`. Les messages sont limités à 200 caractères et à un message toutes les 0,5 s par joueur ; les caractères de contrôle sont supprimés. Les spectateurs lisent le chat mais ne peuvent pas écrire.

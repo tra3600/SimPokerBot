@@ -15,10 +15,12 @@ Exemples :
 """
 import argparse
 import json
+import queue
 import random
 import socket
 import sys
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -572,6 +574,8 @@ def print_report(results, hands):
 # --------------------------------------------------------------------------
 DEFAULT_PORT = 5555
 MAX_SPECTATORS = 20
+MAX_CHAT = 200          # longueur maximale d'un message de chat
+CHAT_INTERVAL = 0.5     # secondes minimum entre deux messages d'un même joueur
 MAX_LINE = 4096  # taille maximale d'un message reçu d'un client
 
 
@@ -609,17 +613,42 @@ class Conn:
 
     def close(self):
         try:
+            self.sock.shutdown(socket.SHUT_RDWR)  # réveille un thread bloqué en lecture
+        except OSError:
+            pass
+        try:
             self.sock.close()
         except OSError:
             pass
 
 
 class RemoteBot(HumanBot):
-    """Joueur distant : mêmes décisions que HumanBot, mais saisies/affichages passent par le réseau."""
+    """Joueur distant : mêmes décisions que HumanBot, mais saisies/affichages passent par le réseau.
 
-    def __init__(self, name, conn, timeout=120):
+    Un thread lit en continu la connexion : les messages de chat sont relayés tout de suite
+    (``on_chat(bot, texte)``), les réponses aux décisions vont dans une file."""
+
+    def __init__(self, name, conn, timeout=120, on_chat=None):
         super().__init__(name, input_fn=self._ask, output_fn=self.tell)
         self.conn, self.timeout, self.gone = conn, timeout, False
+        self.on_chat, self.last_chat = on_chat, 0.0
+        self.replies, self.closed = queue.Queue(), False
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        try:
+            while True:
+                msg = self.conn.recv(None)
+                if "chat" in msg:
+                    if self.on_chat and not self.gone:
+                        self.on_chat(self, msg["chat"])
+                elif "r" in msg:
+                    self.replies.put(msg["r"] if isinstance(msg["r"], str) else "")
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            self.closed = True
+            self.replies.put(None)
 
     def tell(self, text):
         if self.gone:
@@ -630,9 +659,21 @@ class RemoteBot(HumanBot):
             self.disconnect()
 
     def _ask(self, prompt):
+        while True:  # on jette les réponses périmées (arrivées après un timeout)
+            try:
+                self.replies.get_nowait()
+            except queue.Empty:
+                break
+        if self.closed:
+            raise ConnectionError("connexion fermée")
         self.conn.send(t="ask", text=prompt)
-        reply = self.conn.recv(self.timeout).get("r", "")
-        return reply if isinstance(reply, str) else ""
+        try:
+            reply = self.replies.get(timeout=self.timeout)
+        except queue.Empty:
+            raise TimeoutError
+        if reply is None:
+            raise ConnectionError("connexion fermée")
+        return reply
 
     def disconnect(self):
         self.gone = True
@@ -695,6 +736,17 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
                 w.send(t="msg", text=str(text))
             except OSError:
                 drop_spectator(w)
+
+    def on_chat(bot, text):
+        text = "".join(ch for ch in str(text) if ch.isprintable()).strip()[:MAX_CHAT]
+        if not text:
+            return
+        now = time.monotonic()
+        if now - bot.last_chat < CHAT_INTERVAL:
+            bot.tell("(chat) trop rapide, patientez un instant.")
+            return
+        bot.last_chat = now
+        broadcast(f"[chat] {bot.name}: {text}")
 
     def drop_spectator(conn):
         with lock:
@@ -760,10 +812,11 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
                 continue
             name = _unique_name(hello.get("name", ""), taken)
             taken.add(name)
-            bot = RemoteBot(name, conn, timeout)
+            bot = RemoteBot(name, conn, timeout, on_chat)
             remotes.append(bot)
             output_fn(f"{name} connecté depuis {addr[0]} ({len(remotes)}/{players})")
-            bot.tell(f"Bienvenue {name} ! En attente des autres joueurs ({len(remotes)}/{players})...")
+            bot.tell(f"Bienvenue {name} ! En attente des autres joueurs ({len(remotes)}/{players})... "
+                     "Tapez /message pour discuter avec la table.")
             for other in remotes[:-1]:
                 other.tell(f"{name} a rejoint la table ({len(remotes)}/{players}).")
     except BaseException:
@@ -815,22 +868,67 @@ def run_server(host="127.0.0.1", port=DEFAULT_PORT, players=2, opponents=(), han
 
 def run_client(host, port, name="Joueur", input_fn=input, output_fn=print, spectate=False):
     """Se connecte à un serveur et relaie affichages / saisies jusqu'à la fin de la partie.
+
+    Les messages du serveur sont affichés en continu (chat compris). Une ligne commençant par
+    ``/`` est envoyée au chat à tout moment ; toute autre ligne répond à la décision en attente.
     En mode ``spectate`` on regarde la partie sans jouer."""
     conn = Conn(socket.create_connection((host, port), timeout=15))
     conn.send(name=name, role="spectator" if spectate else "player")
+    done, lock, state = threading.Event(), threading.Lock(), {"pending": False}
+
+    def network():
+        try:
+            while True:
+                msg = conn.recv(None)
+                if msg.get("t") == "msg":
+                    output_fn(msg.get("text", ""))
+                elif msg.get("t") == "ask" and not spectate:
+                    with lock:
+                        state["pending"] = True
+                    output_fn(msg.get("text", ""))
+        except (ConnectionError, OSError):
+            output_fn("Connexion terminée.")
+        finally:
+            done.set()
+
+    def keyboard():
+        while not done.is_set():
+            try:
+                line = input_fn("").strip()
+            except (EOFError, KeyboardInterrupt):  # entrée fermée : on quitte proprement
+                with lock:
+                    leaving, state["pending"] = state["pending"], False
+                if leaving:
+                    try:
+                        conn.send(r="q")
+                    except OSError:
+                        pass
+                return
+            try:
+                if line.startswith("/"):
+                    if line[1:].strip():
+                        conn.send(chat=line[1:].strip())
+                    continue
+                with lock:
+                    answering = state["pending"] and bool(line)
+                    if answering:
+                        state["pending"] = False
+                if answering:
+                    conn.send(r=line)
+                elif line:
+                    output_fn("(ce n'est pas votre tour — tapez /message pour discuter)")
+                if line == "q" and answering:
+                    return
+            except OSError:
+                return
+
+    threading.Thread(target=network, daemon=True).start()
+    if not spectate:
+        threading.Thread(target=keyboard, daemon=True).start()
     try:
-        while True:
-            msg = conn.recv(None)
-            if msg.get("t") == "msg":
-                output_fn(msg.get("text", ""))
-            elif msg.get("t") == "ask" and not spectate:
-                try:
-                    answer = input_fn(msg.get("text", ""))
-                except (EOFError, KeyboardInterrupt):
-                    answer = "q"
-                conn.send(r=answer)
-    except (ConnectionError, OSError):
-        output_fn("Connexion terminée.")
+        done.wait()
+    except KeyboardInterrupt:
+        pass
     finally:
         conn.close()
 
