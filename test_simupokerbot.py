@@ -527,3 +527,99 @@ def test_cli_record_and_replay(tmp_path, capsys):
         main(["--mode", "replay", "--history", path, "--hand", "1"])
     assert e.value.code == 0
     assert "Main 1" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Entraînement avec conseils
+# --------------------------------------------------------------------------
+def make_view(hole, board=(), pot=10, to_call=0, stack=100, opponents=1, can_raise=True):
+    from SimuPokerBot import View
+    return View(hole=cards(*hole), board=cards(*board), street="x", pot=pot, to_call=to_call,
+                stack=stack, min_raise_to=to_call * 2 + 2, max_raise_to=stack, opponents=opponents,
+                can_raise=can_raise, big_blind=2, rng=random.Random(0))
+
+
+def test_describe_hole():
+    from SimuPokerBot import describe_hole
+    assert describe_hole(cards("7s", "7h")) == "Paire de 7"
+    assert describe_hole(cards("Ah", "Kh")) == "As-Roi assortis"
+    assert describe_hole(cards("2c", "Qd")) == "Dame-2 dépareillés"
+    assert describe_hole(cards("Ks", "Kd")) == "Paire de Rois"
+    assert describe_hole(cards("As", "Ad")) == "Paire d'As"
+
+
+def test_count_outs_flush_draw_and_no_board_pair_credit():
+    from SimuPokerBot import count_outs
+    # tirage couleur + deux overcards : 9 cœurs + 3 As + 3 Rois
+    assert count_outs(cards("Ah", "Kh"), cards("2h", "7h", "9c")) == 15
+    # pas d'outs hors flop/turn
+    assert count_outs(cards("Ah", "Kh"), []) is None
+    assert count_outs(cards("Ah", "Kh"), cards("2h", "7h", "9c", "3d", "4s")) is None
+
+
+def test_advisor_recommendations():
+    from SimuPokerBot import Advisor
+    adv = Advisor(iterations=1200)
+    assert adv.advise(make_view(("As", "Ah"))).action == "raise"
+    a = adv.advise(make_view(("7c", "2d"), pot=40, to_call=30))
+    assert a.action == "fold" and a.equity < a.needed
+    a = adv.advise(make_view(("As", "Ks"), ("Qs", "Js", "Ts", "2d", "3c"), pot=50, to_call=10))
+    assert a.action == "raise" and a.equity == 1.0 and a.amount >= 22
+    a = adv.advise(make_view(("7c", "2d"), ("Ks", "9h", "4d"), pot=6, to_call=0))
+    assert a.action == "check" and a.amount == 0
+    # ne conseille pas de relancer quand c'est impossible
+    assert adv.advise(make_view(("As", "Ah"), can_raise=False, to_call=2)).action == "call"
+    text = a.text()
+    assert "Conseil : CHECK" in text and "Équité estimée" in text
+
+
+def test_training_bot_flags_clear_mistakes_and_summarizes():
+    from SimuPokerBot import FOLD, TrainingBot
+    out = []
+    bot = TrainingBot(input_fn=lambda p="": "f", output_fn=out.append, advice="always")
+    # AA face à une petite mise : se coucher est une erreur claire
+    view = make_view(("As", "Ah"), pot=10, to_call=2)
+    assert bot.act(view)[0] == FOLD
+    text = "\n".join(out)
+    assert "Conseil" in text and "✘ Écart" in text
+    summary = bot.summary()
+    assert "Décisions : 1" in summary and "erreurs claires : 1" in summary
+    assert "Main 1" in summary
+
+
+def test_training_bot_conforming_decision_and_ask_mode_hint():
+    from SimuPokerBot import CALL, TrainingBot
+    out, answers = [], iter(["?", "c"])
+    bot = TrainingBot(input_fn=lambda p="": next(answers), output_fn=out.append, advice="ask")
+    view = make_view(("As", "Ah"), pot=10, to_call=2, can_raise=False)
+    assert bot.act(view)[0] == CALL
+    text = "\n".join(out)
+    assert "tapez ? pour demander un conseil" in text
+    assert "Conseil : SUIVRE" in text and "✔ Conforme" in text
+
+
+def test_training_off_mode_never_shows_advice_before_decision():
+    from SimuPokerBot import TrainingBot
+    out, answers = [], iter(["?", "c"])  # "?" n'est pas une commande en mode off
+    bot = TrainingBot(input_fn=lambda p="": next(answers), output_fn=out.append, advice="off")
+    bot.act(make_view(("As", "Ah"), pot=10, to_call=2, can_raise=False))
+    text = "\n".join(out)
+    assert ">>> Conseil" not in text and "Commande non reconnue" in text
+
+
+def test_run_training_end_to_end():
+    from SimuPokerBot import run_training
+    out = []
+    bot = run_training(make_bots(["station"]), hands=3, seed=1, input_fn=lambda p="": "c",
+                       output_fn=out.append, advice="always")
+    text = "\n".join(out)
+    assert "Bilan d'entraînement" in text
+    assert len(bot.decisions) >= 3 and bot.hand_index == 3
+
+
+def test_cli_training_mode(monkeypatch, capsys):
+    import io
+    from SimuPokerBot import main
+    monkeypatch.setattr("sys.stdin", io.StringIO("c\n" * 50))
+    main(["--mode", "training", "--bots", "station", "--hands", "2", "--seed", "4", "--advice", "off"])
+    assert "Bilan d'entraînement" in capsys.readouterr().out

@@ -478,6 +478,223 @@ def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=Fal
 
 
 # --------------------------------------------------------------------------
+# Mode entraînement : conseils et débriefing
+# --------------------------------------------------------------------------
+RANK_NAMES = {"A": "As", "K": "Roi", "Q": "Dame", "J": "Valet", "T": "10"}
+ADVICE_MODES = ("always", "ask", "off")
+
+
+HAND_NAMES_FR = {
+    "Royal Flush": "Quinte flush royale", "Straight Flush": "Quinte flush", "Four of a Kind": "Carré",
+    "Full House": "Full", "Flush": "Couleur", "Straight": "Quinte", "Three of a Kind": "Brelan",
+    "Two Pair": "Double paire", "Pair": "Paire", "High Card": "Carte haute"}
+
+
+def hand_name_fr(score):
+    return HAND_NAMES_FR.get(EVALUATOR.class_to_string(EVALUATOR.get_rank_class(score)), "?")
+
+
+def _rank_name(ch):
+    return RANK_NAMES.get(ch, ch)
+
+
+def describe_hole(hole):
+    """Nom lisible d'une main de départ : « Paire de 7 », « As-Roi assortis »..."""
+    a, b = sorted((Card.int_to_str(c) for c in hole), key=lambda c: "23456789TJQKA".index(c[0]),
+                  reverse=True)
+    if a[0] == b[0]:
+        if a[0] == "A":
+            return "Paire d'As"
+        return f"Paire de {_rank_name(a[0])}" + ("s" if a[0] in "KQJ" else "")
+    return f"{_rank_name(a[0])}-{_rank_name(b[0])} " + ("assortis" if a[1] == b[1] else "dépareillés")
+
+
+def count_outs(hole, board):
+    """Cartes (parmi celles restantes) qui améliorent la catégorie de votre main au prochain tirage.
+
+    Estimation pédagogique, valable au flop et au turn. On ignore l'amélioration « pair » qui
+    vient seulement d'une paire du board (elle profite aussi à l'adversaire)."""
+    if len(board) not in (3, 4):
+        return None
+    before = EVALUATOR.get_rank_class(EVALUATOR.evaluate(board, hole))
+    known = set(hole) | set(board)
+    hole_ranks = {Card.get_rank_int(c) for c in hole}
+    outs = 0
+    for card in Deck.GetFullDeck():
+        if card in known:
+            continue
+        after = EVALUATOR.get_rank_class(EVALUATOR.evaluate(list(board) + [card], hole))
+        if after < before and not (before == 9 and after == 8
+                                   and Card.get_rank_int(card) not in hole_ranks):
+            outs += 1
+    return outs
+
+
+@dataclass
+class Advice:
+    action: str            # "fold" | "check" | "call" | "raise"
+    amount: int
+    equity: float
+    pot_odds: float
+    needed: float          # équité minimale conseillée pour suivre
+    ev_call: float         # espérance (jetons) de suivre, approximation sur la main en cours
+    outs: int
+    hand: str
+    reasons: list
+    unseen: int = 47       # cartes encore inconnues (pour convertir les outs en %)
+
+    def text(self):
+        lines = [f"    Main : {self.hand}",
+                 f"    Équité estimée : {self.equity:.0%} (contre des mains aléatoires)"]
+        if self.pot_odds:
+            lines.append(f"    Cotes du pot : {self.pot_odds:.0%} | EV de suivre : {self.ev_call:+.1f} jetons")
+        if self.outs is not None:
+            lines.append(f"    Outs approximatifs : {self.outs} "
+                         f"(≈ {self.outs / self.unseen:.0%} d'améliorer au prochain tirage)")
+        what = {"fold": "SE COUCHER", "check": "CHECK", "call": "SUIVRE",
+                "raise": f"RELANCER à {self.amount}"}[self.action]
+        lines.append(f"    >>> Conseil : {what}")
+        lines += [f"        - {r}" for r in self.reasons]
+        return "\n".join(lines)
+
+
+class Advisor:
+    """Conseille une décision à partir de l'équité Monte-Carlo et des cotes du pot."""
+
+    def __init__(self, raise_threshold=0.62, call_margin=0.05, bet_fraction=0.7, iterations=1500):
+        self.raise_threshold, self.call_margin = raise_threshold, call_margin
+        self.bet_fraction, self.iterations = bet_fraction, iterations
+
+    def advise(self, view):
+        eq = estimate_equity(view.hole, view.board, view.opponents, self.iterations, view.rng)
+        odds = view.pot_odds
+        needed = odds + self.call_margin
+        ev_call = eq * (view.pot + view.to_call) - view.to_call
+        strong = eq >= self.raise_threshold - (0.08 if view.opponents == 1 else 0.0)
+        reasons = []
+        if view.board:
+            hand = hand_name_fr(EVALUATOR.evaluate(view.board, view.hole)) if len(view.board) >= 3 else ""
+        else:
+            hand = describe_hole(view.hole)
+        if view.opponents > 1:
+            reasons.append(f"Table à {view.opponents + 1} joueurs : plus il y a d'adversaires, "
+                           "plus il faut de force.")
+        if strong and view.can_raise:
+            action = "raise"
+            amount = min(view.max_raise_to,
+                         max(view.min_raise_to, view.to_call + int(view.pot * self.bet_fraction)))
+            reasons.insert(0, "Votre équité est élevée : relancez pour faire payer les mains "
+                              "inférieures et protéger votre main.")
+        elif view.to_call == 0:
+            action, amount = "check", 0
+            reasons.insert(0, "Rien à payer : voyez la carte suivante gratuitement "
+                              "(main trop faible pour miser pour la valeur).")
+        elif eq >= needed:
+            action, amount = "call", 0
+            reasons.insert(0, f"Votre équité ({eq:.0%}) dépasse les cotes du pot ({odds:.0%}) : "
+                              "suivre est rentable à long terme.")
+        else:
+            action, amount = "fold", 0
+            reasons.insert(0, f"Il faut ≈ {needed:.0%} d'équité pour suivre (cotes du pot {odds:.0%} "
+                              f"+ marge), vous n'avez que {eq:.0%} : se coucher.")
+        if view.to_call and view.to_call >= view.stack:
+            reasons.append("Suivre vous met à tapis : décision pour tout votre tapis.")
+        if view.board and view.to_call:
+            reasons.append("Un adversaire qui mise a souvent une main plus forte qu'une main "
+                           "aléatoire : soyez plus prudent que le chiffre brut.")
+        return Advice(action, amount, eq, odds, needed, ev_call, count_outs(view.hole, view.board),
+                      hand, reasons, 52 - 2 - len(view.board))
+
+
+class TrainingBot(HumanBot):
+    """Humain assisté : conseils avant la décision (``always``) ou sur demande avec ``?`` (``ask``),
+    puis retour sur chaque décision et bilan de session."""
+
+    def __init__(self, name="Vous", input_fn=input, output_fn=print, advice="always", advisor=None):
+        super().__init__(name, input_fn=self._ask_with_help, output_fn=output_fn)
+        self.raw_input, self.mode = input_fn, advice
+        self.advisor = advisor or Advisor()
+        self.decisions = []
+        self._advice = None
+        self._shown = self._announced = False
+        self.hand_index, self._last_hole = 0, None
+
+    def _ask_with_help(self, prompt):
+        if not self._announced:  # après le résumé de la situation, juste avant la saisie
+            self._announced = True
+            if self.mode == "always":
+                self.say(self._advice.text())
+                self._shown = True
+            elif self.mode == "ask":
+                self.say("    (tapez ? pour demander un conseil)")
+        while True:
+            line = self.raw_input(prompt)
+            if self.mode != "off" and line.strip().lower() in ("?", "h", "conseil"):
+                self.say(self._advice.text())
+                self._shown = True
+                continue
+            return line
+
+    def act(self, view):
+        if view.hole != self._last_hole:
+            self._last_hole, self.hand_index = view.hole, self.hand_index + 1
+        self._advice, self._shown, self._announced = self.advisor.advise(view), False, False
+        action, amount = super().act(view)
+        self.say(self._debrief(view, action, self._advice))
+        return action, amount
+
+    def _debrief(self, view, action, adv):
+        kind = "check" if action == CALL and not view.to_call else action
+        agrees = kind == adv.action or (kind in ("call", "check") and adv.action in ("call", "check"))
+        loss = 0.0
+        if action == FOLD and adv.equity >= adv.needed:
+            loss = max(adv.ev_call, 0.0)
+        elif action == CALL and view.to_call and adv.equity < adv.pot_odds - 0.03:
+            loss = max(-adv.ev_call, 0.0)
+        self.decisions.append({"hand": self.hand_index, "street": view.street, "action": kind,
+                               "advised": adv.action, "agrees": agrees, "loss": loss,
+                               "hole": Card.ints_to_pretty_str(view.hole).strip(),
+                               "equity": adv.equity})
+        if loss > 0:
+            tip = (f"se coucher abandonnait ≈ {loss:.1f} jetons d'espérance (équité {adv.equity:.0%} "
+                   f"contre {adv.needed:.0%} nécessaires)" if action == FOLD else
+                   f"suivre perd ≈ {loss:.1f} jetons en moyenne (équité {adv.equity:.0%} < cotes "
+                   f"du pot {adv.pot_odds:.0%})")
+            return f"    ✘ Écart : {tip}."
+        if agrees:
+            return "    ✔ Conforme au conseil."
+        if kind == "raise":
+            return "    ~ Relance plus agressive que le conseil : un bluff peut se défendre si l'adversaire peut se coucher."
+        return f"    ~ Autre choix que le conseil ({adv.action}) : écart sans perte claire."
+
+    def summary(self, big_blind=2):
+        d = self.decisions
+        if not d:
+            return "Entraînement : aucune décision à analyser."
+        ok = sum(x["agrees"] for x in d)
+        loss = sum(x["loss"] for x in d)
+        errors = sorted((x for x in d if x["loss"] > 0), key=lambda x: -x["loss"])
+        lines = [f"=== Bilan d'entraînement ===",
+                 f"Décisions : {len(d)} | conformes aux conseils : {ok / len(d):.0%} | "
+                 f"erreurs claires : {len(errors)}",
+                 f"Espérance perdue estimée : {loss:.1f} jetons ({loss / big_blind:.1f} bb)"]
+        for x in errors[:3]:
+            lines.append(f"  - Main {x['hand']} ({x['street']}) {x['hole']} : {x['action']} au lieu de "
+                         f"{x['advised']} (≈ -{x['loss']:.1f}, équité {x['equity']:.0%})")
+        return "\n".join(lines)
+
+
+def run_training(opponents, hands=None, stack=100, big_blind=2, seed=None, advice="always",
+                 input_fn=input, output_fn=print, name="Vous", history=None):
+    """Entraînement : comme le mode humain, avec conseils et bilan final. Renvoie le TrainingBot."""
+    bot = TrainingBot(name, input_fn=input_fn, output_fn=output_fn, advice=advice)
+    run_human(opponents, hands, stack, big_blind, seed, input_fn, output_fn, name=name,
+              history=history, human=bot)
+    output_fn("\n" + bot.summary(big_blind))
+    return bot
+
+
+# --------------------------------------------------------------------------
 # Historique et replay des mains
 # --------------------------------------------------------------------------
 DEFAULT_HISTORY = "mains.jsonl"
@@ -706,7 +923,7 @@ class Leaderboard:
 
 
 def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
-              input_fn=input, output_fn=print, name="Vous", leaderboard=None, history=None):
+              input_fn=input, output_fn=print, name="Vous", leaderboard=None, history=None, human=None):
     """Partie interactive : l'humain (siège 0) contre des bots, tapis remis à ``stack`` à chaque main.
 
     S'arrête après ``hands`` mains (illimité si None) ou quand le joueur tape ``q``.
@@ -715,7 +932,7 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
     rng = random.Random(seed)
     if seed is not None:
         random.seed(seed)
-    human = HumanBot(name, input_fn=input_fn, output_fn=output_fn)
+    human = human or HumanBot(name, input_fn=input_fn, output_fn=output_fn)
     bots = [human] + list(opponents)
     net, played = 0, 0
     while hands is None or played < hands:
@@ -1222,7 +1439,7 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay"), default="cash",
+    p.add_argument("--mode", choices=("cash", "tournament", "human", "server", "client", "leaderboard", "replay", "training"), default="cash",
                    help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
                         "human : vous jouez contre les bots ; server / client : partie en réseau")
     p.add_argument("--host", default=None,
@@ -1245,6 +1462,9 @@ def main(argv=None):
     p.add_argument("--step", action="store_true", help="mode replay : Entrée pour passer à l'étape suivante")
     p.add_argument("--delay", type=float, default=0.0, help="mode replay : pause (s) entre deux étapes")
     p.add_argument("--player", default=None, help="mode replay --list : n'afficher que les mains de ce joueur")
+    p.add_argument("--advice", choices=ADVICE_MODES, default="always",
+                   help="mode training : always = conseil avant chaque décision, ask = sur demande (?), "
+                        "off = seulement le retour après coup")
     p.add_argument("--spectate", action="store_true",
                    help="mode client : regarder la partie sans jouer (avant ou pendant)")
     p.add_argument("--players", type=int, default=2, help="joueurs humains attendus (mode server)")
@@ -1280,10 +1500,14 @@ def main(argv=None):
                    args.big_blind if args.big_blind != 2 else None,
                    args.level_hands, args.seed, args.timeout, leaderboard=board, history=history)
         return
-    human = args.mode == "human"
+    human = args.mode in ("human", "training")
     if not (1 if human else 2) <= len(names) <= (8 if human else 9):
         p.error(f"il faut entre {1 if human else 2} et {8 if human else 9} bots")
     bots = make_bots(names)
+    if args.mode == "training":
+        run_training(bots, args.hands if hands_given else None, args.stack, args.big_blind, args.seed,
+                     args.advice, name=args.name or "Vous", history=history)
+        return
     if args.mode == "human" and args.tournament:
         run_human_tournament(bots, args.stack if args.stack != 100 else 1000,
                              args.big_blind if args.big_blind != 2 else 20,

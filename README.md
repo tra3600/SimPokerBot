@@ -86,3 +86,15 @@ Enregistrer les mains jouées, puis les rejouer avec **toutes** les cartes visib
 - `--mode replay` relit le fichier (`mains.jsonl` par défaut) : `--list` liste les mains numérotées (joueurs, board, pot, gagnants ; `--player NOM` filtre), `--hand N` rejoue la main N (la dernière par défaut), `--step` avance à chaque Entrée (`q` pour arrêter), `--delay 1.5` marque une pause entre les étapes.
 - Le replay montre pour chaque action le pot courant, les tapis, les cartes montrées au showdown et le résultat net de chacun.
 - Les lignes illisibles du fichier sont ignorées ; le code de sortie est 1 si le replay est impossible (fichier absent, main introuvable).
+
+## Mode entraînement (conseils)
+    python SimuPokerBot.py --mode training --bots tight,loose
+    python SimuPokerBot.py --mode training --bots equity --advice ask --hands 30 --history mains.jsonl
+
+Comme le mode humain (mêmes commandes), mais avec un coach :
+- `--advice always` (défaut) : avant chaque décision, votre main, l'équité estimée (Monte-Carlo contre des mains aléatoires), les cotes du pot, l'espérance de gain d'un call, les outs approximatifs au flop/turn, puis le conseil (se coucher / check / suivre / relancer à X) avec ses raisons.
+- `--advice ask` : le conseil n'apparaît que si vous tapez `?` ; `--advice off` : aucun conseil, uniquement le retour après coup.
+- Après chaque décision : ✔ conforme au conseil, ~ autre choix sans perte claire, ou ✘ erreur claire (ex. se coucher alors que l'équité dépasse nettement les cotes, ou suivre avec une équité inférieure aux cotes) avec l'espérance perdue estimée.
+- À la fin (`q` ou `--hands N`) : bilan avec le % de décisions conformes, le nombre d'erreurs claires, l'espérance perdue en jetons/bb et vos 3 pires erreurs (main, tour, cartes).
+
+Limites : l'équité est calculée contre des mains aléatoires et l'EV ne regarde que la main en cours (pas de cotes implicites, de bluff ni de lecture de l'adversaire). Le conseil est un repère pédagogique, pas un solveur. Les résultats de l'entraînement ne sont pas enregistrés au classement.
