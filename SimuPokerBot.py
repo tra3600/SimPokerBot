@@ -11,6 +11,7 @@ Exemples :
     python SimuPokerBot.py --bots tight,maniac,station,random --hands 500 --verbose
     python SimuPokerBot.py --mode tournament --tournaments 20 --seed 1
     python SimuPokerBot.py --mode human --bots tight,loose,maniac
+    python SimuPokerBot.py --mode human --tournament --bots tight,loose,maniac
 """
 import argparse
 import random
@@ -468,11 +469,14 @@ def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
 
 
 def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
-                   blind_growth=1.5, max_hands=1000, seed=None, verbose=False):
+                   blind_growth=1.5, max_hands=1000, seed=None, verbose=False,
+                   log=None, show_hole=True, stop_when_out=None):
     """Joue un tournoi jusqu'à ce qu'il reste un joueur.
 
     Les blinds augmentent de ``blind_growth`` toutes les ``level_hands`` mains.
     Renvoie la liste des noms classés du vainqueur au premier éliminé.
+    ``stop_when_out`` : un bot dont l'élimination arrête le tournoi (le reste est classé
+    selon les tapis). ``log`` reçoit le texte affiché, ``show_hole=False`` cache les cartes.
     """
     rng = random.Random(seed)
     if seed is not None:
@@ -480,16 +484,18 @@ def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
     stacks = {i: starting_stack for i in range(len(bots))}
     out = []  # éliminés, du premier au dernier
     button, bb, hand_no = 0, big_blind, 0
-    log = print if verbose else None
+    log = log or (print if verbose else None)
+    say = log or (lambda *_: None)
     while len(stacks) > 1 and hand_no < max_hands:
         alive = list(stacks)
         if hand_no and hand_no % level_hands == 0:
             bb = max(bb + 2, int(bb * blind_growth)) // 2 * 2
-        if verbose:
-            print(f"\n=== Main {hand_no + 1} (blinds {bb // 2}/{bb}) ===")
+        say(f"\n=== Main {hand_no + 1} (blinds {bb // 2}/{bb}) ===")
+        if stop_when_out is not None:
+            say("Tapis : " + ", ".join(f"{bots[i].name} {stacks[i]}" for i in alive))
         button %= len(alive)
         hand = Hand([bots[i] for i in alive], button=button,
-                    stack=[stacks[i] for i in alive], big_blind=bb, rng=rng, log=log)
+                    stack=[stacks[i] for i in alive], big_blind=bb, rng=rng, log=log, show_hole=show_hole)
         profit = hand.play()
         busted = []
         for k, i in enumerate(alive):
@@ -500,13 +506,36 @@ def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
         for i in sorted(busted, key=lambda j: hand.start[alive.index(j)]):
             del stacks[i]
             out.append(i)
-            if verbose:
-                print(f"  *** {bots[i].name} est éliminé ({len(stacks) + 1}e)")
+            say(f"  *** {bots[i].name} est éliminé ({len(stacks) + 1}e)")
+        if any(bots[i] is stop_when_out for i in busted):
+            break
         button = (button + 1) % max(len(stacks), 1)
         hand_no += 1
     # Si max_hands atteint : classement par tapis restant.
     out += sorted(stacks, key=lambda j: stacks[j])
     return [bots[i].name for i in reversed(out)]
+
+
+def run_human_tournament(opponents, stack=1000, big_blind=20, level_hands=10, seed=None,
+                         input_fn=input, output_fn=print):
+    """Tournoi interactif : l'humain affronte ``opponents`` jusqu'à son élimination ou sa victoire.
+
+    Renvoie la place finale de l'humain (1 = vainqueur) ou None s'il abandonne (``q``).
+    """
+    human = HumanBot(input_fn=input_fn, output_fn=output_fn)
+    bots = [human] + list(opponents)
+    try:
+        ranking = run_tournament(bots, stack, big_blind, level_hands, seed=seed, log=output_fn,
+                                 show_hole=False, stop_when_out=human)
+    except QuitGame:
+        output_fn("\nVous avez abandonné le tournoi.")
+        return None
+    place = ranking.index(human.name) + 1
+    if place == 1:
+        output_fn("\n*** Bravo, vous remportez le tournoi ! ***")
+    else:
+        output_fn(f"\nVous êtes éliminé : {place}e sur {len(bots)}. Meneur au moment de votre élimination : {ranking[0]}.")
+    return place
 
 
 def run_tournaments(bots, count=1, **kwargs):
@@ -548,6 +577,8 @@ def main(argv=None):
                         "human : vous jouez contre les bots")
     p.add_argument("--tournaments", type=int, default=1, help="nombre de tournois (mode tournament)")
     p.add_argument("--level-hands", type=int, default=10, help="mains par niveau de blinds (tournoi)")
+    p.add_argument("--tournament", action="store_true",
+                   help="avec --mode human : jouer un tournoi (élimination, blinds croissantes)")
     p.add_argument("--verbose", action="store_true", help="affiche chaque main")
     args = p.parse_args(argv)
 
@@ -556,6 +587,11 @@ def main(argv=None):
     if not low <= len(names) <= 9 - (args.mode == "human"):
         p.error(f"il faut entre {low} et {9 - (args.mode == 'human')} bots")
     bots = make_bots(names)
+    if args.mode == "human" and args.tournament:
+        run_human_tournament(bots, args.stack if args.stack != 100 else 1000,
+                             args.big_blind if args.big_blind != 2 else 20,
+                             args.level_hands, args.seed)
+        return
     if args.mode == "human":
         run_human(bots, args.hands if "--hands" in (argv or sys.argv) else None,
                   args.stack, args.big_blind, args.seed)

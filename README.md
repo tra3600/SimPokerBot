@@ -36,3 +36,8 @@ Tapis initial 1000 et blinds 10/20 par défaut (`--stack`, `--big-blind`). Les b
 Vous êtes le siège 0 contre les bots listés dans `--bots` (1 à 8). Le tapis est remis à `--stack` à chaque main ; la partie continue jusqu'à `--hands` mains ou jusqu'à ce que vous tapiez `q`. Vos cartes et l'état du pot s'affichent à chaque décision ; les cartes des adversaires ne sont révélées qu'au showdown.
 
 Commandes : `f` se coucher · `c` suivre / check · `r [montant]` relancer *à* ce montant total sur le tour (minimum si omis) · `a` tapis · `q` quitter.
+
+### Tournoi en mode humain
+    python SimuPokerBot.py --mode human --tournament --bots tight,loose,maniac --seed 1
+
+Même format que le mode tournoi (1000 jetons, blinds 10/20 croissantes toutes les `--level-hands` mains), mais les tapis restent d'une main à l'autre : la ligne « Tapis » rappelle les stacks avant chaque main. Le tournoi s'arrête quand vous êtes éliminé (votre place finale s'affiche), quand vous gagnez, ou quand vous tapez `q`.

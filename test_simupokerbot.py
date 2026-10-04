@@ -126,3 +126,20 @@ def test_human_invalid_input_reprompts_and_hides_opponent_cards():
     assert "Commande non reconnue" in text or "Montant invalide" in text
     # avant le showdown, les cartes de l'adversaire ne sont pas affichées
     assert not any(l.strip().startswith("station:") and "[" in l for l in out[:3])
+
+
+def test_human_tournament_all_in_every_hand_ends():
+    from SimuPokerBot import run_human_tournament
+    out = []
+    place = run_human_tournament(make_bots(["station", "maniac"]), seed=7,
+                                 input_fn=lambda prompt="": "a" if "a = tapis" in prompt else "c",
+                                 output_fn=out.append)
+    text = "\n".join(out)
+    assert place in (1, 2, 3)
+    assert "Bravo" in text or "éliminé" in text
+
+
+def test_human_tournament_quit_returns_none():
+    from SimuPokerBot import run_human_tournament
+    assert run_human_tournament(make_bots(["station"]), seed=1, input_fn=scripted("q"),
+                                output_fn=lambda *_: None) is None
