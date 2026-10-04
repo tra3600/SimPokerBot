@@ -10,9 +10,11 @@ Exemples :
     python SimuPokerBot.py --hands 2000 --seed 1
     python SimuPokerBot.py --bots tight,maniac,station,random --hands 500 --verbose
     python SimuPokerBot.py --mode tournament --tournaments 20 --seed 1
+    python SimuPokerBot.py --mode human --bots tight,loose,maniac
 """
 import argparse
 import random
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -154,6 +156,59 @@ class EquityBot(Bot):
         return FOLD, 0
 
 
+class QuitGame(Exception):
+    """Le joueur humain quitte la partie."""
+
+
+class HumanBot(Bot):
+    """Joueur humain : lit ses décisions au clavier (``input_fn`` / ``output_fn`` injectables)."""
+    name = "Vous"
+
+    def __init__(self, name="Vous", input_fn=input, output_fn=print):
+        self.name = name
+        self.ask, self.say = input_fn, output_fn
+
+    def act(self, view):
+        say = self.say
+        say(f"\n>>> Vos cartes : {Card.ints_to_pretty_str(view.hole)}")
+        if view.board:
+            say(f"    Board ({view.street}) : {Card.ints_to_pretty_str(view.board)}")
+        say(f"    Pot : {view.pot} | à suivre : {view.to_call} | votre tapis : {view.stack} "
+            f"| adversaires : {view.opponents}")
+        options = ["f = se coucher"] if view.to_call else []
+        options.append(f"c = suivre ({view.to_call})" if view.to_call else "c = check")
+        if view.can_raise:
+            options.append(f"r [montant] = relancer à {view.min_raise_to}-{view.max_raise_to}")
+            options.append("a = tapis")
+        options.append("q = quitter")
+        while True:
+            try:
+                raw = self.ask("    " + " | ".join(options) + "\n    > ").strip().lower()
+            except EOFError:
+                raise QuitGame
+            cmd, _, arg = raw.partition(" ")
+            if cmd == "q":
+                raise QuitGame
+            if cmd == "f" and view.to_call:
+                return FOLD, 0
+            if cmd == "c":
+                return CALL, 0
+            if cmd == "a" and view.can_raise:
+                return RAISE, view.max_raise_to
+            if cmd == "r" and view.can_raise:
+                if not arg.strip():
+                    return RAISE, view.min_raise_to
+                try:
+                    amount = int(arg)
+                except ValueError:
+                    amount = None
+                if amount is not None and view.min_raise_to <= amount <= view.max_raise_to:
+                    return RAISE, amount
+                say(f"    Montant invalide (entre {view.min_raise_to} et {view.max_raise_to}).")
+                continue
+            say("    Commande non reconnue.")
+
+
 STRATEGIES = {
     "tight": lambda: EquityBot("tight", raise_threshold=0.70, call_margin=0.08, bluff_freq=0.02),
     "equity": lambda: EquityBot("equity"),
@@ -205,7 +260,9 @@ def split_pots(contributions, live):
 class Hand:
     """Une main de Hold'em entre ``len(bots)`` joueurs. ``self.profit`` = gain net par joueur."""
 
-    def __init__(self, bots, button=0, stack=100, big_blind=2, rng=random, log=None):
+    def __init__(self, bots, button=0, stack=100, big_blind=2, rng=random, log=None,
+                 show_hole=True):
+        self.show_hole = show_hole
         self.bots, self.n = bots, len(bots)
         self.button, self.bb, self.rng = button, big_blind, rng
         self.log = log or (lambda *_: None)
@@ -240,8 +297,9 @@ class Hand:
     def play(self):
         deck = Deck()
         self.hands, _ = deal_hands(self.n, deck)
-        for i, h in enumerate(self.hands):
-            self.log(f"  {self.bots[i].name}: {Card.ints_to_pretty_str(h)}")
+        if self.show_hole:
+            for i, h in enumerate(self.hands):
+                self.log(f"  {self.bots[i].name}: {Card.ints_to_pretty_str(h)}")
 
         if self.n == 2:
             sb, bb = self.button, self._seat(1)
@@ -347,6 +405,8 @@ class Hand:
                 for k, w in enumerate(winners):
                     payout[w] += share + (1 if k < rest else 0)
             for i in live:
+                if not self.show_hole:  # cartes révélées seulement au showdown
+                    self.log(f"  {self.bots[i].name}: {Card.ints_to_pretty_str(self.hands[i])}")
                 self.log(f"  {self.bots[i].name}: {EVALUATOR.class_to_string(EVALUATOR.get_rank_class(scores[i]))}")
         self.profit = [payout[i] - self.total[i] for i in range(self.n)]
         for i, p in enumerate(self.profit):
@@ -376,6 +436,35 @@ def run_session(bots, hands=1000, stack=100, big_blind=2, seed=None, verbose=Fal
     return {b.name: {"net": net[b.name], "bb": net[b.name] / big_blind,
                      "bb_per_100": net[b.name] / big_blind / hands * 100,
                      "win_rate": wins[b.name] / hands} for b in bots}
+
+
+def run_human(opponents, hands=None, stack=100, big_blind=2, seed=None,
+              input_fn=input, output_fn=print):
+    """Partie interactive : l'humain (siège 0) contre des bots, tapis remis à ``stack`` à chaque main.
+
+    S'arrête après ``hands`` mains (illimité si None) ou quand le joueur tape ``q``.
+    Renvoie le gain net de l'humain en jetons et le nombre de mains terminées.
+    """
+    rng = random.Random(seed)
+    if seed is not None:
+        random.seed(seed)
+    human = HumanBot(input_fn=input_fn, output_fn=output_fn)
+    bots = [human] + list(opponents)
+    net, played = 0, 0
+    while hands is None or played < hands:
+        output_fn(f"\n=== Main {played + 1} (blinds {big_blind // 2}/{big_blind}) ===")
+        hand = Hand(bots, button=played % len(bots), stack=stack, big_blind=big_blind,
+                    rng=rng, log=output_fn, show_hole=False)
+        try:
+            profit = hand.play()
+        except QuitGame:
+            break
+        net += profit[0]
+        played += 1
+        output_fn(f"--- Résultat : {profit[0]:+d} | total : {net:+d} jetons "
+                  f"({net / big_blind:+.1f} bb) sur {played} main(s)")
+    output_fn(f"\nFin de la partie : {net:+d} jetons ({net / big_blind:+.1f} bb) sur {played} main(s).")
+    return net, played
 
 
 def run_tournament(bots, starting_stack=1000, big_blind=20, level_hands=10,
@@ -454,17 +543,23 @@ def main(argv=None):
     p.add_argument("--stack", type=int, default=100, help="tapis initial à chaque main")
     p.add_argument("--big-blind", type=int, default=2)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--mode", choices=("cash", "tournament"), default="cash",
-                   help="cash : tapis remis à zéro à chaque main ; tournament : élimination")
+    p.add_argument("--mode", choices=("cash", "tournament", "human"), default="cash",
+                   help="cash : bots seuls, tapis remis à zéro à chaque main ; tournament : élimination ; "
+                        "human : vous jouez contre les bots")
     p.add_argument("--tournaments", type=int, default=1, help="nombre de tournois (mode tournament)")
     p.add_argument("--level-hands", type=int, default=10, help="mains par niveau de blinds (tournoi)")
     p.add_argument("--verbose", action="store_true", help="affiche chaque main")
     args = p.parse_args(argv)
 
     names = [n.strip() for n in args.bots.split(",") if n.strip()]
-    if not 2 <= len(names) <= 9:
-        p.error("il faut entre 2 et 9 bots")
+    low = 1 if args.mode == "human" else 2
+    if not low <= len(names) <= 9 - (args.mode == "human"):
+        p.error(f"il faut entre {low} et {9 - (args.mode == 'human')} bots")
     bots = make_bots(names)
+    if args.mode == "human":
+        run_human(bots, args.hands if "--hands" in (argv or sys.argv) else None,
+                  args.stack, args.big_blind, args.seed)
+        return
     if args.mode == "tournament":
         stack = args.stack if args.stack != 100 else 1000
         bb = args.big_blind if args.big_blind != 2 else 20

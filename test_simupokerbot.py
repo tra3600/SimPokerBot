@@ -90,3 +90,39 @@ def test_tournaments_stats():
     res = run_tournaments(make_bots(["maniac", "station", "random"]), count=3, seed=1)
     assert sum(r["wins"] for r in res.values()) == 3
     assert abs(sum(r["avg_place"] for r in res.values()) - 6) < 1e-9
+
+
+def scripted(*answers):
+    it = iter(answers)
+    return lambda _prompt="": next(it)
+
+
+def test_human_mode_plays_and_quits():
+    from SimuPokerBot import run_human
+    out = []
+    # toujours "c" (suivre/check), puis "q" pour quitter à la main suivante
+    answers = ["c"] * 40 + ["q"]
+    net, played = run_human(make_bots(["station", "random"]), hands=2, seed=1,
+                            input_fn=scripted(*answers), output_fn=out.append)
+    assert played == 2
+    text = "\n".join(out)
+    assert "Vos cartes" in text and "Fin de la partie" in text
+
+
+def test_human_quit_ends_session():
+    from SimuPokerBot import run_human
+    net, played = run_human(make_bots(["station"]), seed=1, input_fn=scripted("q"),
+                            output_fn=lambda *_: None)
+    assert played == 0 and net == 0
+
+
+def test_human_invalid_input_reprompts_and_hides_opponent_cards():
+    from SimuPokerBot import run_human
+    out = []
+    run_human(make_bots(["station"]), hands=1, seed=2,
+              input_fn=scripted("zzz", "r 9999", "c", "c", "c", "c", "c", "c"),
+              output_fn=out.append)
+    text = "\n".join(out)
+    assert "Commande non reconnue" in text or "Montant invalide" in text
+    # avant le showdown, les cartes de l'adversaire ne sont pas affichées
+    assert not any(l.strip().startswith("station:") and "[" in l for l in out[:3])
